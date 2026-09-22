@@ -1,0 +1,14 @@
+# Keep the build context to the sources: a local .venv alone is ~83 MB.
+.venv/
+venv/
+.git/
+.github/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+__pycache__/
+*.py[cod]
+tests/
+.env
+data/
+*.log
