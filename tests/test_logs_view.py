@@ -92,8 +92,8 @@ async def test_tool_calls_show_up_in_the_view(
     assert "subject=Invoice" in body
     assert "Logged connector" in body
     assert "ada@example.test" in body
-    assert ">ok<" in body and ">error<" in body
-    assert "<b>3</b> recorded calls" in body
+    assert "Succeeded" in body and "Failed" in body
+    assert "<b>3</b><span>recorded calls</span>" in body
 
 
 async def test_filters_narrow_the_view(client, connection, activity_log, monkeypatch):
@@ -107,12 +107,13 @@ async def test_filters_narrow_the_view(client, connection, activity_log, monkeyp
     assert "<code>list_messages</code>" not in only.text
 
     failures = await client.get("/logs", params={"status": "error"})
-    assert "Nothing recorded yet" in failures.text or "0 call" in failures.text
+    assert "No call matches these filters" in failures.text
+    assert "Clear filters" in failures.text
 
     other_connector = await client.get(
         "/logs", params={"connection_id": "con_somebody_else"}
     )
-    assert "Nothing recorded yet" in other_connector.text
+    assert "No call matches these filters" in other_connector.text
 
 
 async def test_another_user_sees_nothing(client, connection, activity_log, monkeypatch):
@@ -170,7 +171,7 @@ async def test_read_only_refusals_are_recorded_as_denied(
     )
     monkeypatch.setattr(web, "_uid", lambda request: OWNER)
     body = (await client.get("/logs")).text
-    assert ">denied<" in body
+    assert "Refused" in body
     assert "read-only" in body
 
 

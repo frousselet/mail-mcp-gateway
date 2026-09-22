@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import hmac
 import json
 import logging
 import os
@@ -181,6 +182,17 @@ class ConnectionStore:
                 "Re-add the affected mailbox."
             )
             return ""
+
+    def session_secret(self) -> str:
+        """A cookie-signing key that survives a restart.
+
+        Derived from the store's own encryption key, which is already generated
+        once and persisted, so sessions no longer die on every restart while
+        the mailbox passwords survive. It is a separate value, not the key
+        itself: signing cookies and encrypting credentials are different jobs.
+        """
+        material = self._fernet._signing_key + self._fernet._encryption_key
+        return hmac.new(material, b"mail-mcp session cookie", hashlib.sha256).hexdigest()
 
     @staticmethod
     def _hash(token: str) -> str:
@@ -402,6 +414,22 @@ class ConnectionStore:
             self._flush()
             return True
 
+    async def set_default_calendar(
+        self, connection_id: str, calendar_id: str, owner_id: str | None = None
+    ) -> bool:
+        async with self._lock:
+            record = self._data["connections"].get(connection_id)
+            if record is None:
+                return False
+            if owner_id is not None and record.get("owner_id", "") != owner_id:
+                return False
+            if calendar_id not in record.get("calendars", {}):
+                return False
+            record["default_calendar_id"] = calendar_id
+            record["revision"] = record.get("revision", 0) + 1
+            self._flush()
+            return True
+
     # --- users and passkeys ---
 
     def has_user(self) -> bool:
@@ -441,17 +469,47 @@ class ConnectionStore:
                 "public_key": public_key,
                 "sign_count": sign_count,
                 "transports": transports or [],
+                "created_at": int(time.time()),
+                "last_used": 0,
             }
             self._flush()
 
     def get_credential(self, credential_id: str) -> dict[str, Any] | None:
         return self._data["credentials"].get(credential_id)
 
+    def list_credentials(self, user_id: str) -> list[dict[str, Any]]:
+        """The passkeys that can sign in as this user, oldest first."""
+        out = [
+            {"credential_id": credential_id, **record}
+            for credential_id, record in self._data["credentials"].items()
+            if record.get("user_id") == user_id
+        ]
+        out.sort(key=lambda record: record.get("created_at", 0))
+        return out
+
+    async def delete_credential(self, user_id: str, credential_id: str) -> bool:
+        """Remove one passkey, never the last one: that would lock the user out."""
+        async with self._lock:
+            record = self._data["credentials"].get(credential_id)
+            if record is None or record.get("user_id") != user_id:
+                return False
+            remaining = [
+                other
+                for other, value in self._data["credentials"].items()
+                if value.get("user_id") == user_id and other != credential_id
+            ]
+            if not remaining:
+                return False
+            self._data["credentials"].pop(credential_id, None)
+            self._flush()
+            return True
+
     async def update_sign_count(self, credential_id: str, sign_count: int) -> None:
         async with self._lock:
             record = self._data["credentials"].get(credential_id)
             if record is not None:
                 record["sign_count"] = sign_count
+                record["last_used"] = int(time.time())
                 self._flush()
 
     # --- OAuth codes (stored by hash) ---

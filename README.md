@@ -239,7 +239,18 @@ picks the one to act on.
 - Deleting a connector, or issuing it a new secret, immediately revokes the
   tokens already handed out.
 - `MAIL_ONBOARD_CODE` gates self-registration when the gateway is reachable
-  from the internet.
+  from the internet; without it, anyone who can open the page can create an
+  account, and the UI says so on the Passkeys page.
+- The session cookie is `Secure` by default, because the documented deployment
+  terminates TLS at a reverse proxy and forwards plain HTTP. Set
+  `MAIL_INSECURE_COOKIE=1` only for a plain-HTTP LAN address; localhost is
+  already treated as a secure origin by browsers.
+- The cookie signing key is derived from the store's persisted encryption key,
+  so a restart no longer signs everyone out.
+- Pages carry no inline script or style and are served under a strict
+  Content-Security-Policy (`script-src 'self'`), so an escaping mistake cannot
+  become code execution. Destructive actions are confirmed on a server-rendered
+  page rather than by a `confirm()` dialog.
 - A mailbox can be attached read-only, which is enforced before anything is
   composed, sent or written.
 
@@ -277,7 +288,7 @@ every variable.
 
 ```bash
 uv venv && uv pip install -e ".[dev]"
-uv run pytest        # 228 tests, including fake IMAP and CalDAV servers
+uv run pytest        # 255 tests, including fake IMAP and CalDAV servers
 uv run ruff check src tests
 ```
 

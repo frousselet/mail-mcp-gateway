@@ -53,8 +53,10 @@ def _form(caldav_server, **overrides) -> dict[str, str]:
 
 async def _new_connector(client, label="With calendars") -> str:
     response = await client.post("/connections/new", data={"label": label})
-    client_id = re.search(r"(mail_[0-9a-f]+)", response.text).group(1)
-    return server.STORE.get_connection_by_client_id(client_id).connection_id
+    assert response.status_code == 303
+    return re.search(
+        r"/connections/([^/]+)/credentials", response.headers["location"]
+    ).group(1)
 
 
 async def test_the_form_is_reachable(client):
@@ -70,15 +72,15 @@ async def test_attach_a_calendar(client, caldav_server):
     response = await client.post(
         f"/connections/{connection_id}/calendars", data=_form(caldav_server)
     )
-    assert response.status_code == 200
-    assert "calendars are now available" in response.text
+    assert response.status_code == 303
+    assert response.headers["location"] == "/?notice=calendar_added"
+    dashboard = await client.get(response.headers["location"])
+    assert "Calendar added" in dashboard.text
 
     stored = server.STORE.get_connection(connection_id)
     assert [c.address for c in stored.calendars] == [caldav_server.username]
     assert stored.calendars[0].timezone == "Europe/Paris"
     assert stored.default_calendar_id == stored.calendars[0].account_id
-    # And it shows on the dashboard.
-    dashboard = await client.get("/")
     assert caldav_server.username in dashboard.text
     assert "Europe/Paris" in dashboard.text
 
@@ -121,9 +123,19 @@ async def test_remove_a_calendar(client, caldav_server):
     await client.post(f"/connections/{connection_id}/calendars", data=_form(caldav_server))
     calendar_id = server.STORE.get_connection(connection_id).calendars[0].account_id
 
+    confirmation = await client.get(
+        "/calendars/remove",
+        params={"connection_id": connection_id, "calendar_id": calendar_id},
+    )
+    assert "Remove this calendar" in confirmation.text
+
     response = await client.post(
         "/calendars/delete",
-        data={"connection_id": connection_id, "calendar_id": calendar_id},
+        data={
+            "connection_id": connection_id,
+            "calendar_id": calendar_id,
+            "confirm": "yes",
+        },
     )
     assert response.status_code == 303
     assert server.STORE.get_connection(connection_id).calendars == []
@@ -143,6 +155,68 @@ async def test_another_user_cannot_touch_it(client, caldav_server, monkeypatch):
             "calendar_id": server.STORE.get_connection(connection_id)
             .calendars[0]
             .account_id,
+            "confirm": "yes",
         },
     )
     assert server.STORE.get_connection(connection_id).calendars
+
+
+# ---------------------------------------------------------------------------
+# Passkeys: the account must not be a single point of failure
+# ---------------------------------------------------------------------------
+
+
+async def test_registering_a_known_email_again_is_refused(client, monkeypatch):
+    """It used to mint a second, empty account and hide the user's own work."""
+    store = server.STORE
+    await store.create_user("taken@example.test")
+
+    monkeypatch.setattr(web, "_uid", lambda request: None)
+    response = await client.post(
+        "/webauthn/register/begin", json={"email": "taken@example.test"}
+    )
+    assert response.status_code == 409
+    assert "already exists" in response.json()["error"]
+    assert "Sign in with your passkey" in response.json()["error"]
+
+
+async def test_a_signed_in_user_can_start_adding_another_passkey(client):
+    page = await client.get("/register")
+    assert page.status_code == 200
+    assert "Add a passkey" in page.text
+
+    response = await client.post(
+        "/webauthn/register/begin", json={"email": "owner@example.test"}
+    )
+    assert response.status_code == 200
+    assert "challenge" in response.json()
+
+
+async def test_the_account_page_lists_passkeys_and_refuses_to_remove_the_last(client):
+    store = server.STORE
+    await store.add_credential(USER_ID, "cred-one", "pk", 0)
+
+    page = await client.get("/account")
+    assert page.status_code == 200
+    assert "cred-one"[:12] in page.text
+    assert "only passkey" in page.text
+
+    removed = await client.post(
+        "/account/passkeys/delete", data={"credential_id": "cred-one"}
+    )
+    assert removed.status_code == 303
+    assert store.get_credential("cred-one") is not None  # kept: it is the last one
+
+    await store.add_credential(USER_ID, "cred-two", "pk", 0)
+    await client.post("/account/passkeys/delete", data={"credential_id": "cred-one"})
+    assert store.get_credential("cred-one") is None
+    assert store.get_credential("cred-two") is not None
+
+
+async def test_passkeys_of_other_users_cannot_be_removed(client, monkeypatch):
+    store = server.STORE
+    await store.add_credential("usr_victim", "victim-one", "pk", 0)
+    await store.add_credential("usr_victim", "victim-two", "pk", 0)
+
+    await client.post("/account/passkeys/delete", data={"credential_id": "victim-one"})
+    assert store.get_credential("victim-one") is not None

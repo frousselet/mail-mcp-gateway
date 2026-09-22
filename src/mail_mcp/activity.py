@@ -240,3 +240,42 @@ def _default_path() -> str:
     """Sit next to the connection store, wherever that lives."""
     store = os.environ.get("MAIL_STORE", "") or "/data/mail_connections.json"
     return str(Path(store).with_name("mail_activity.jsonl"))
+
+
+def summarise_by_connection(log: ActivityLog, owner_id: str) -> dict[str, dict[str, Any]]:
+    """Per-connector activity for the dashboard: last use, recent volume, errors.
+
+    One pass over the entries this owner can see, so showing "last used" on the
+    dashboard costs no extra read.
+    """
+    week_ago = time.time() - 7 * 86400
+    out: dict[str, dict[str, Any]] = {}
+    for entry in log.read(owner_id=owner_id, limit=log._max_entries or 1):
+        bucket = out.setdefault(
+            entry.connection_id, {"last_ts": 0.0, "calls_7d": 0, "errors_7d": 0}
+        )
+        bucket["last_ts"] = max(bucket["last_ts"], entry.ts)
+        if entry.ts >= week_ago:
+            bucket["calls_7d"] += 1
+            if entry.status != "ok":
+                bucket["errors_7d"] += 1
+    return out
+
+
+def humanise_age(stamp: float, now: float) -> str:
+    """'3 minutes ago' and friends, for a timestamp that may be zero."""
+    if not stamp:
+        return ""
+    seconds = max(0, int(now - stamp))
+    if seconds < 60:
+        return "just now"
+    for below, unit, name in (
+        (3600, 60, "minute"),
+        (86400, 3600, "hour"),
+        (604800, 86400, "day"),
+    ):
+        if seconds < below:
+            count = max(1, seconds // unit)
+            return f"{count} {name}{'s' if count > 1 else ''} ago"
+    weeks = max(1, seconds // 604800)
+    return f"{weeks} week{'s' if weeks > 1 else ''} ago"

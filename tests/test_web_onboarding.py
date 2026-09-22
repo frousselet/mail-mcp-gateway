@@ -52,16 +52,21 @@ def _mailbox_form(imap_server, password: str | None = None) -> dict[str, str]:
 
 
 async def _new_connector(client: httpx.AsyncClient, label: str = "Work") -> str:
-    """Create a connector and return its id, read back from the page it shows."""
+    """Create a connector and return its id, read back from the redirect."""
     response = await client.post("/connections/new", data={"label": label})
-    assert response.status_code == 200, response.text
-    assert "Connector ready" in response.text
-    client_id = re.search(r"(mail_[0-9a-f]+)", response.text).group(1)
-    connection = server.STORE.get_connection_by_client_id(client_id)
+    assert response.status_code == 303, response.text
+    location = response.headers["location"]
+    connection_id = re.search(r"/connections/([^/]+)/credentials", location).group(1)
+    connection = server.STORE.get_connection(connection_id)
     assert connection is not None
     assert connection.label == label
-    assert connection.client_secret in response.text
-    return connection.connection_id
+
+    # The credentials page is a plain GET, so a refresh cannot re-create anything.
+    page = await client.get(location)
+    assert page.status_code == 200
+    assert connection.client_secret in page.text
+    assert connection.client_id in page.text
+    return connection_id
 
 
 async def test_connector_creation_requires_a_name(client):
@@ -80,9 +85,11 @@ async def test_attach_a_mailbox_and_see_it_listed(client, imap_server, smtp_ok):
     response = await client.post(
         f"/connections/{connection_id}/mailboxes", data=_mailbox_form(imap_server)
     )
-    assert response.status_code == 200, response.text
-    assert "is now available to this connector" in response.text
-    assert imap_server.state.username in response.text
+    assert response.status_code == 303, response.text
+    assert response.headers["location"] == "/?notice=mailbox_added"
+    dashboard = await client.get(response.headers["location"])
+    assert "Mailbox added" in dashboard.text
+    assert imap_server.state.username in dashboard.text
 
     stored = server.STORE.get_connection(connection_id)
     assert [a.address for a in stored.accounts] == [imap_server.state.username]
@@ -135,22 +142,61 @@ async def test_mailbox_removal(client, imap_server, smtp_ok):
     )
     account_id = server.STORE.get_connection(connection_id).accounts[0].account_id
 
-    response = await client.post(
+    # Removal is confirmed on a real page, not by a confirm() dialog.
+    confirmation = await client.get(
+        "/mailboxes/remove",
+        params={"connection_id": connection_id, "account_id": account_id},
+    )
+    assert confirmation.status_code == 200
+    assert "Remove this mailbox" in confirmation.text
+    assert server.STORE.get_connection(connection_id).accounts  # nothing yet
+
+    unconfirmed = await client.post(
         "/mailboxes/delete",
         data={"connection_id": connection_id, "account_id": account_id},
+    )
+    assert unconfirmed.status_code == 400
+    assert server.STORE.get_connection(connection_id).accounts  # still nothing
+
+    response = await client.post(
+        "/mailboxes/delete",
+        data={
+            "connection_id": connection_id,
+            "account_id": account_id,
+            "confirm": "yes",
+        },
     )
     assert response.status_code == 303
     assert server.STORE.get_connection(connection_id).accounts == []
 
 
-async def test_rotating_the_secret_shows_a_new_one(client):
+async def test_rotating_the_secret_is_confirmed_then_shown(client):
     connection_id = await _new_connector(client)
     before = server.STORE.get_connection(connection_id).client_secret
-    response = await client.post("/connections/rotate", data={"connection_id": connection_id})
+
+    confirmation = await client.get(
+        "/connections/rotate", params={"connection_id": connection_id}
+    )
+    assert "Issue a new secret" in confirmation.text
+    assert server.STORE.get_connection(connection_id).client_secret == before
+
+    response = await client.post(
+        "/connections/rotate", data={"connection_id": connection_id, "confirm": "yes"}
+    )
+    assert response.status_code == 303
     after = server.STORE.get_connection(connection_id).client_secret
-    assert response.status_code == 200
     assert after != before
-    assert after in response.text
+    page = await client.get(response.headers["location"])
+    assert after in page.text
+
+
+async def test_the_client_secret_can_be_looked_up_again(client):
+    """It is stored encrypted, not hashed, so pretending otherwise only hurt."""
+    connection_id = await _new_connector(client)
+    secret = server.STORE.get_connection(connection_id).client_secret
+    page = await client.get(f"/connections/{connection_id}/credentials")
+    assert page.status_code == 200
+    assert secret in page.text
 
 
 async def test_test_endpoint_reports_failures_without_saving(client, imap_server, smtp_ok):
@@ -187,7 +233,78 @@ async def test_connectors_of_other_users_are_invisible(client, monkeypatch):
     response = await client.get(f"/connections/{connection_id}")
     assert "no longer exists" in response.text
     response = await client.post(
-        "/connections/delete", data={"connection_id": connection_id}
+        "/connections/delete",
+        data={"connection_id": connection_id, "confirm": "yes"},
     )
     assert response.status_code == 303
     assert server.STORE.get_connection(connection_id) is not None
+
+    # And its credentials are not readable by them either.
+    credentials = await client.get(f"/connections/{connection_id}/credentials")
+    assert "no longer exists" in credentials.text
+
+
+# ---------------------------------------------------------------------------
+# The browser-facing hardening
+# ---------------------------------------------------------------------------
+
+
+async def test_html_responses_carry_a_strict_csp(client):
+    response = await client.get("/")
+    policy = response.headers["content-security-policy"]
+    assert "script-src 'self'" in policy
+    assert "unsafe-inline" not in policy
+    assert "frame-ancestors 'none'" in policy
+    assert response.headers["x-content-type-options"] == "nosniff"
+
+
+async def test_the_mcp_endpoint_is_not_given_html_headers(client):
+    response = await client.post(
+        "/mcp",
+        headers={"Accept": "application/json, text/event-stream"},
+        json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+    )
+    assert response.status_code == 401
+    assert "content-security-policy" not in response.headers
+
+
+async def test_the_assets_are_served_with_a_cacheable_fingerprint(client):
+    from mail_mcp import assets
+
+    css = await client.get("/assets/app.css")
+    assert css.status_code == 200
+    assert css.headers["content-type"].startswith("text/css")
+    assert "immutable" in css.headers["cache-control"]
+    assert css.headers["etag"] == f'"{assets.CSS_VERSION}"'
+
+    again = await client.get(
+        "/assets/app.css", headers={"If-None-Match": f'"{assets.CSS_VERSION}"'}
+    )
+    assert again.status_code == 304
+
+    js = await client.get("/assets/app.js")
+    assert js.status_code == 200
+    assert js.headers["content-type"].startswith("text/javascript")
+
+
+async def test_the_session_cookie_is_secure_by_default(monkeypatch):
+    from starlette.middleware.sessions import SessionMiddleware
+
+    monkeypatch.delenv("MAIL_INSECURE_COOKIE", raising=False)
+    app = web.build_app()
+    session = next(
+        m for m in app.user_middleware if m.cls is SessionMiddleware
+    )
+    assert session.kwargs["https_only"] is True
+
+    monkeypatch.setenv("MAIL_INSECURE_COOKIE", "1")
+    relaxed = next(
+        m for m in web.build_app().user_middleware if m.cls is SessionMiddleware
+    )
+    assert relaxed.kwargs["https_only"] is False
+
+
+async def test_the_session_key_survives_a_restart(monkeypatch):
+    monkeypatch.delenv("MAIL_SECRET_KEY", raising=False)
+    assert web._session_secret() == web._session_secret()
+    assert web._session_secret() == server.STORE.session_secret()

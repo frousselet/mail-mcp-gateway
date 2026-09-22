@@ -1,334 +1,110 @@
-"""HTML for the onboarding web UI.
+"""The pages, rendered server-side.
 
-Deliberately dependency-free: a handful of server-rendered pages, one small
-stylesheet and the WebAuthn glue the browser needs. Nothing here talks to the
-store; :mod:`mail_mcp.web` passes in plain data.
+Every page is a function returning a string. The stylesheet and the script live
+in :mod:`mail_mcp.assets` and are linked, never inlined, so the HTML carries no
+``style`` or ``on*`` attribute and a strict Content-Security-Policy can forbid
+both. Behaviour is attached by ``data-action`` hooks that the script binds on a
+delegated listener.
+
+Two rules hold throughout:
+
+- every interpolated value goes through :func:`esc`, and no value is ever
+  placed in a JavaScript context, because HTML escaping is not JavaScript
+  escaping and an attribute is decoded before its script is parsed;
+- anything destructive is confirmed by a server-rendered page, not by a
+  ``confirm()`` dialog, so the guard survives scripting being off.
 """
 
 from __future__ import annotations
 
 import html
-import os
 from typing import Any
 
-_PAGE = """<!doctype html>
-<html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Mail MCP Gateway</title>
-<style>
-  :root { color-scheme: light dark; --accent: #2d6cdf; --danger: #c0392b; }
-  * { box-sizing: border-box; }
-  body { font-family: system-ui, -apple-system, sans-serif; max-width: 820px;
-         margin: 2.5rem auto; padding: 0 1rem; line-height: 1.5; }
-  h1 { font-size: 1.5rem; } h2 { font-size: 1.15rem; margin-top: 2rem; }
-  h3 { font-size: 1rem; margin: 1.2rem 0 .3rem; }
-  label { display: block; margin-top: .9rem; font-weight: 600; }
-  input, select { width: 100%; padding: .55rem; margin-top: .3rem;
-         border: 1px solid #8888; border-radius: 6px; font-size: 1rem;
-         background: transparent; color: inherit; }
-  input[type=checkbox] { width: auto; margin-right: .4rem; }
-  small { color: #888; font-weight: 400; }
-  button { margin-top: 1rem; padding: .6rem 1.1rem; font-size: 1rem;
-           border-radius: 6px; border: 0; background: var(--accent); color: #fff;
-           cursor: pointer; }
-  button.secondary { background: #666; }
-  button.danger { background: var(--danger); }
-  button.small { padding: .3rem .6rem; font-size: .85rem; margin: 0; }
-  .card { border: 1px solid #8884; border-radius: 10px; padding: 1rem 1.2rem;
-          margin-top: 1rem; }
-  code { background: #8882; padding: .15rem .4rem; border-radius: 4px;
-         word-break: break-all; }
-  .muted { color: #888; font-size: .9rem; }
-  .err { color: var(--danger); white-space: pre-wrap; }
-  .ok { color: #1e8449; }
-  .top { display: flex; justify-content: space-between; align-items: center;
-         flex-wrap: wrap; gap: .5rem; }
-  .row { margin: .6rem 0; }
-  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0 1rem; }
-  .inline { display: flex; gap: .5rem; align-items: flex-end; flex-wrap: wrap; }
-  table { width: 100%; border-collapse: collapse; margin-top: .5rem; }
-  th, td { text-align: left; padding: .45rem .3rem; border-bottom: 1px solid #8883;
-           vertical-align: top; }
-  details summary { cursor: pointer; margin-top: 1rem; font-weight: 600; }
-  .filters { display: flex; gap: .6rem; flex-wrap: wrap; align-items: flex-end; }
-  .filters label { margin-top: 0; font-size: .85rem; }
-  .filters select, .filters input { min-width: 9rem; }
-  .filters button { margin-top: 0; }
-  .pill { display: inline-block; padding: .1rem .45rem; border-radius: 999px;
-          font-size: .75rem; font-weight: 600; }
-  .pill.ok { background: #1e844933; color: #1e8449; }
-  .pill.error { background: #c0392b33; color: var(--danger); }
-  .pill.denied { background: #b9770e33; color: #b9770e; }
-  .logs td { font-size: .9rem; }
-  .logs .args { color: #888; font-size: .8rem; word-break: break-word; }
-  .stats { display: flex; gap: 1.5rem; flex-wrap: wrap; margin: .5rem 0 0; }
-  .stats b { font-size: 1.2rem; display: block; }
-  @media (max-width: 640px) { .grid { grid-template-columns: 1fr; } }
-</style></head><body>
-{{body}}
-</body></html>"""
+from mail_mcp.assets import CSS_VERSION, JS_VERSION
 
-COMMON_JS = """
-<script>
-function b64urlToBuf(s){s=s.replace(/-/g,'+').replace(/_/g,'/');const p=s.length%4;
- if(p)s+='='.repeat(4-p);const b=atob(s);const u=new Uint8Array(b.length);
- for(let i=0;i<b.length;i++)u[i]=b.charCodeAt(i);return u.buffer;}
-function bufToB64url(buf){const u=new Uint8Array(buf);let s='';
- for(const b of u)s+=String.fromCharCode(b);
- return btoa(s).replace(/\\+/g,'-').replace(/\\//g,'_').replace(/=+$/,'');}
-async function postJSON(url,body){const r=await fetch(url,{method:'POST',
- headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})});
- const j=await r.json().catch(()=>({}));
- if(!r.ok)throw new Error(j.error||('HTTP '+r.status));return j;}
-function setErr(m){const e=document.getElementById('err');if(e)e.textContent=m||'';}
-</script>
-"""
-
-WEBAUTHN_JS = """
-<script>
-async function doRegister(email,code){
- setErr('');
- const opts=await postJSON('/webauthn/register/begin',{email:email,code:code});
- opts.challenge=b64urlToBuf(opts.challenge);opts.user.id=b64urlToBuf(opts.user.id);
- if(opts.excludeCredentials)for(const c of opts.excludeCredentials)c.id=b64urlToBuf(c.id);
- const cred=await navigator.credentials.create({publicKey:opts});
- await postJSON('/webauthn/register/complete',{credential:{
-   id:cred.id,rawId:bufToB64url(cred.rawId),type:cred.type,
-   clientExtensionResults:cred.getClientExtensionResults?cred.getClientExtensionResults():{},
-   response:{clientDataJSON:bufToB64url(cred.response.clientDataJSON),
-    attestationObject:bufToB64url(cred.response.attestationObject),
-    transports:cred.response.getTransports?cred.response.getTransports():[]}}});
- location.href='/';
-}
-async function doLogin(){
- setErr('');
- const opts=await postJSON('/webauthn/login/begin',{});
- opts.challenge=b64urlToBuf(opts.challenge);
- if(opts.allowCredentials)for(const c of opts.allowCredentials)c.id=b64urlToBuf(c.id);
- const cred=await navigator.credentials.get({publicKey:opts});const r=cred.response;
- await postJSON('/webauthn/login/complete',{credential:{
-   id:cred.id,rawId:bufToB64url(cred.rawId),type:cred.type,
-   clientExtensionResults:cred.getClientExtensionResults?cred.getClientExtensionResults():{},
-   response:{clientDataJSON:bufToB64url(r.clientDataJSON),
-    authenticatorData:bufToB64url(r.authenticatorData),
-    signature:bufToB64url(r.signature),
-    userHandle:r.userHandle?bufToB64url(r.userHandle):null}}});
- location.href='/';
-}
-</script>
-"""
-
-MAILBOX_JS = """
-<script>
-function val(id){const e=document.getElementById(id);return e?e.value.trim():'';}
-function setVal(id,v){const e=document.getElementById(id);if(e&&v!==undefined&&v!==null)e.value=v;}
-function status(msg,cls){const e=document.getElementById('probe');
- if(e){e.textContent=msg;e.className=cls||'muted';}}
-function settingsPayload(){
- return {address:val('address'),imap_host:val('imap_host'),imap_port:val('imap_port'),
-  imap_security:val('imap_security'),imap_username:val('imap_username'),
-  smtp_host:val('smtp_host'),smtp_port:val('smtp_port'),
-  smtp_security:val('smtp_security'),smtp_username:val('smtp_username'),
-  auth:val('auth'),secret:val('secret'),oauth_provider:val('oauth_provider'),
-  oauth_client_id:val('oauth_client_id'),oauth_client_secret:val('oauth_client_secret'),
-  oauth_tenant:val('oauth_tenant'),
-  verify_ssl:document.getElementById('verify_ssl').checked};
-}
-async function detect(){
- const address=val('address');
- if(!address){status('Enter an address first.','err');return;}
- status('Looking up the provider settings...');
- try{
-  const j=await postJSON('/discover',{address:address});
-  if(!j.found){status('No published settings for this domain: fill the servers in by hand.','err');return;}
-  setVal('imap_host',j.settings.imap_host);setVal('imap_port',j.settings.imap_port);
-  setVal('imap_security',j.settings.imap_security);
-  setVal('smtp_host',j.settings.smtp_host);setVal('smtp_port',j.settings.smtp_port);
-  setVal('smtp_security',j.settings.smtp_security);
-  const notes=(j.settings.notes||[]).join(' ');
-  status('Found via '+j.settings.source+(j.settings.provider_name?(' ('+j.settings.provider_name+')'):'')+'. '+notes,'ok');
-  document.getElementById('advanced').open=true;
- }catch(e){status(e.message,'err');}
-}
-async function testConn(){
- status('Connecting to IMAP and SMTP...');
- try{
-  const j=await postJSON('/test',settingsPayload());
-  status(j.message,j.ok?'ok':'err');
- }catch(e){status(e.message,'err');}
-}
-function onAuthChange(){
- const oauth=val('auth')==='xoauth2';
- document.getElementById('oauth_fields').style.display=oauth?'block':'none';
- document.getElementById('secret_label').textContent=oauth?'OAuth refresh token':'Password or app password';
-}
-</script>
-"""
-
-
-def page(body: str) -> str:
-    return _PAGE.replace("{{body}}", body)
+PRODUCT = "Mail MCP Gateway"
 
 
 def esc(value: Any) -> str:
-    return html.escape(str(value if value is not None else ""))
+    """HTML-escape a value for either element or attribute position."""
+    return html.escape(str(value if value is not None else ""), quote=True)
 
 
-def register_page() -> str:
-    code_field = ""
-    if os.environ.get("MAIL_ONBOARD_CODE"):
-        code_field = (
-            '<label>Invite code<input id="code" autocomplete="off" required></label>'
-        )
-    return page(f"""
-<h1>Create your account</h1>
-<p class="muted">Passwordless: your account is secured with a passkey (Touch ID,
-Windows Hello, a security key or your phone).</p>
-<p id="err" class="err"></p>
-<div class="card">
-  <label>Email<input id="email" type="email" required placeholder="you@example.com"></label>
-  {code_field}
-  <button onclick="const e=document.getElementById('email').value.trim();
-    const c=document.getElementById('code')?document.getElementById('code').value.trim():'';
-    if(!e){{setErr('Enter an email.');return;}}
-    doRegister(e,c).catch(x=>setErr(x.message))">Create passkey</button>
-</div>
-<p class="muted">Already have an account? <a href="/login">Sign in</a></p>
-{COMMON_JS}{WEBAUTHN_JS}
-""")
+# ---------------------------------------------------------------------------
+# Shell
+# ---------------------------------------------------------------------------
 
 
-def login_page() -> str:
-    return page(f"""
-<h1>Sign in</h1>
-<p id="err" class="err"></p>
-<div class="card">
-  <button onclick="doLogin().catch(x=>setErr(x.message))">Sign in with passkey</button>
-</div>
-<p class="muted">No account yet? <a href="/register">Create one</a></p>
-{COMMON_JS}{WEBAUTHN_JS}
-""")
-
-
-def dashboard_page(
-    email: str, connections: list[dict[str, Any]], error: str = "", notice: str = ""
+def page(
+    body: str,
+    *,
+    title: str,
+    nav: str = "",
+    after: str = "",
 ) -> str:
-    error_html = f'<p class="err">{esc(error)}</p>' if error else ""
-    notice_html = f'<p class="ok">{esc(notice)}</p>' if notice else ""
+    """Wrap a body in the document shell.
 
-    if connections:
-        cards = []
-        for connection in connections:
-            mailboxes = connection["accounts"]
-            if mailboxes:
-                rows = "".join(
-                    f"<tr><td>{esc(box['address'])}"
-                    + (" <small>(default)</small>" if box["is_default"] else "")
-                    + (
-                        f"<br><small class='muted'>Sends as "
-                        f"{esc(', '.join(box.get('sends_as', [])))}</small>"
-                        if len(box.get("sends_as", [])) > 1
-                        or (box.get("sends_as") or [box["address"]])[0] != box["address"]
-                        else ""
-                    )
-                    + f"<br><small class='muted'>{esc(box['imap'])} | "
-                    f"{esc(box['smtp'])} | {esc(box['auth'])}"
-                    + (" | read-only" if box["read_only"] else "")
-                    + "</small></td>"
-                    f"<td style='width:1%;white-space:nowrap'>"
-                    f'<form method="post" action="/mailboxes/delete" style="display:inline">'
-                    f'<input type="hidden" name="connection_id" value="{esc(connection["connection_id"])}">'
-                    f'<input type="hidden" name="account_id" value="{esc(box["account_id"])}">'
-                    f'<button class="small danger" '
-                    f"onclick=\"return confirm('Remove {esc(box['address'])} from this connector?')\">"
-                    f"Remove</button></form></td></tr>"
-                    for box in mailboxes
-                )
-                table = f"<table><tr><th>Mailbox</th><th></th></tr>{rows}</table>"
-            else:
-                table = (
-                    "<p class='muted'>No mailbox yet. Add one to make this "
-                    "connector useful.</p>"
-                )
-            calendars = connection.get("calendars", [])
-            if calendars:
-                calendar_rows = "".join(
-                    f"<tr><td>{esc(calendar['address'])}"
-                    + (" <small>(default)</small>" if calendar["is_default"] else "")
-                    + f"<br><small class='muted'>{esc(calendar['url'])}"
-                    f" | {esc(calendar['timezone'])}"
-                    + (" | read-only" if calendar["read_only"] else "")
-                    + "</small></td>"
-                    f"<td style='width:1%;white-space:nowrap'>"
-                    f'<form method="post" action="/calendars/delete" style="display:inline">'
-                    f'<input type="hidden" name="connection_id" value="{esc(connection["connection_id"])}">'
-                    f'<input type="hidden" name="calendar_id" value="{esc(calendar["account_id"])}">'
-                    f'<button class="small danger" '
-                    f"onclick=\"return confirm('Remove {esc(calendar['address'])} from this connector?')\">"
-                    f"Remove</button></form></td></tr>"
-                    for calendar in calendars
-                )
-                table += (
-                    "<table><tr><th>Calendar account</th><th></th></tr>"
-                    + calendar_rows
-                    + "</table>"
-                )
-            cards.append(f"""
-<div class="card">
-  <div class="top">
-    <h3 style="margin:0">{esc(connection['label'] or 'Connector')}</h3>
-    <span class="muted">{len(mailboxes)} mailbox(es), {len(connection.get("calendars", []))} calendar(s)</span>
+    ``title`` names the page: seven tabs called "Mail MCP Gateway" are no help
+    to anyone halfway through setup.
+    """
+    return f"""<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{esc(title)} - {PRODUCT}</title>
+<link rel="stylesheet" href="/assets/app.css?v={CSS_VERSION}">
+<script src="/assets/app.js?v={JS_VERSION}" defer></script>
+</head>
+<body{f' data-after="{esc(after)}"' if after else ""}>
+<a class="skip" href="#main">Skip to content</a>
+<div class="shell">
+{nav}
+<main id="main">
+{body}
+</main>
+</div>
+</body></html>"""
+
+
+def _header(title: str, email: str = "", current: str = "") -> str:
+    """The page heading, plus the signed-in navigation when there is a session."""
+    if not email:
+        return f'<header class="top"><h1>{esc(title)}</h1></header>'
+
+    def link(href: str, text: str, key: str) -> str:
+        mark = ' aria-current="page"' if key == current else ""
+        return f'<a href="{esc(href)}"{mark}>{esc(text)}</a>'
+
+    return f"""<header class="top">
+  <h1>{esc(title)}</h1>
+  <div class="who">
+    <nav class="main" aria-label="Main">
+      {link("/", "Connectors", "connectors")}
+      {link("/logs", "Activity", "logs")}
+      {link("/account", "Passkeys", "account")}
+      {link("/logout", "Sign out", "logout")}
+    </nav>
+    {esc(email)}
   </div>
-  <div class="row muted">MCP URL: <code>{esc(connection['mcp_url'])}</code><br>
-    OAuth client ID: <code>{esc(connection['client_id'])}</code></div>
-  {table}
-  <div class="inline">
-    <a href="/connections/{esc(connection['connection_id'])}"><button class="small">Add a mailbox</button></a>
-    <a href="/connections/{esc(connection['connection_id'])}/calendar"><button class="small">Add a calendar</button></a>
-    <form method="post" action="/connections/rotate" style="margin:0">
-      <input type="hidden" name="connection_id" value="{esc(connection['connection_id'])}">
-      <button class="small secondary"
-        onclick="return confirm('Issue a new client secret? The agent will have to reconnect.')">
-        New secret</button>
-    </form>
-    <form method="post" action="/connections/delete" style="margin:0">
-      <input type="hidden" name="connection_id" value="{esc(connection['connection_id'])}">
-      <button class="small danger"
-        onclick="return confirm('Delete this connector? The agent loses access immediately.')">
-        Delete</button>
-    </form>
-  </div>
-</div>""")
-        connections_html = "".join(cards)
-    else:
-        connections_html = (
-            "<p class='muted'>No connector yet. Create one below, then attach "
-            "the mailboxes it should serve.</p>"
-        )
+</header>"""
 
-    gate = ""
-    if os.environ.get("MAIL_ONBOARD_CODE"):
-        gate = ('<label>Invite code<input name="onboard_code" required '
-                'autocomplete="off"></label>')
 
-    return page(f"""
-<div class="top"><h1>Your MCP connectors</h1>
-  <span class="muted">{esc(email)} &middot; <a href="/logs">Activity log</a>
-    &middot; <a href="/logout">Sign out</a></span></div>
-{error_html}{notice_html}
-{connections_html}
+def _notice(message: str, kind: str = "info") -> str:
+    if not message:
+        return ""
+    role = ' role="alert"' if kind == "error" else ' role="status"'
+    return f'<p class="notice notice-{esc(kind)}"{role}>{esc(message)}</p>'
 
-<h2>New connector</h2>
-<p class="muted">One connector is one MCP connection for an agent. Give it a
-single mailbox for a dedicated connector, or several to let the agent work
-across addresses.</p>
-<form method="post" action="/connections/new" class="card">
-  {gate}
-  <label>Name <small>(what you will recognise it by)</small>
-    <input name="label" required autocomplete="off" placeholder="Work inbox"></label>
-  <button type="submit">Create connector</button>
-</form>
-""")
+
+def _badge(text: str, kind: str) -> str:
+    return f'<span class="badge badge-{esc(kind)}">{esc(text)}</span>'
+
+
+def access_badge(read_only: bool) -> str:
+    """Say in words what the agent may do; never colour alone."""
+    if read_only:
+        return _badge("Read only", "read")
+    return _badge("Can send and delete", "write")
 
 
 def _option_list(options: list[tuple[str, str]], selected: str) -> str:
@@ -339,129 +115,636 @@ def _option_list(options: list[tuple[str, str]], selected: str) -> str:
     )
 
 
-def mailbox_form_page(connection: dict[str, Any], error: str = "") -> str:
-    error_html = f'<p class="err">{esc(error)}</p>' if error else ""
-    security = [("ssl", "SSL/TLS"), ("starttls", "STARTTLS"), ("none", "None (plain)")]
-    return page(f"""
-<div class="top"><h1>Add a mailbox</h1>
-  <span class="muted"><a href="/">Back to connectors</a></span></div>
-<p class="muted">Connector: <b>{esc(connection['label'])}</b></p>
-{error_html}
-<form method="post" action="/connections/{esc(connection['connection_id'])}/mailboxes"
-      class="card">
-  <label>Email address
-    <div class="inline">
-      <input id="address" name="address" type="email" required style="flex:1"
-             placeholder="you@example.com">
-      <button type="button" class="secondary" onclick="detect()">Detect settings</button>
-    </div></label>
-  <label id="secret_label">Password or app password
-    <input id="secret" name="secret" type="password" required autocomplete="off"></label>
-  <p id="probe" class="muted">Most providers require an app password rather than
-    your normal one.</p>
+def _hidden(fields: dict[str, str]) -> str:
+    return "".join(
+        f'<input type="hidden" name="{esc(name)}" value="{esc(value)}">'
+        for name, value in fields.items()
+    )
 
-  <label>Display name <small>(optional, used in the From header)</small>
-    <input id="from_name" name="from_name" autocomplete="off" placeholder="Ada Lovelace"></label>
 
-  <label>Send from <small>(optional, when mail should go out as another address)</small>
-    <input id="from_address" name="from_address" type="email" autocomplete="off"
-           placeholder="you@your-domain.com"></label>
-  <label>Other sending addresses <small>(optional, comma-separated)</small>
-    <input id="aliases" name="aliases" autocomplete="off"
-           placeholder="contact@your-domain.com, billing@your-domain.com"></label>
-  <p class="muted">Leave both empty to send as the address above. An iCloud+ custom
-    domain is the usual reason to fill them in: you sign in with your Apple ID but
-    write as your own address. The agent may only send as one of these.</p>
+SECURITY_CHOICES = [("ssl", "SSL/TLS"), ("starttls", "STARTTLS"), ("none", "None (plain)")]
 
-  <div class="grid">
-    <label>IMAP server<input id="imap_host" name="imap_host" required
-      placeholder="imap.example.com"></label>
-    <label>IMAP port<input id="imap_port" name="imap_port" type="number" value="993"></label>
-    <label>IMAP security<select id="imap_security" name="imap_security">
-      {_option_list(security, "ssl")}</select></label>
-    <label>SMTP server<input id="smtp_host" name="smtp_host" required
-      placeholder="smtp.example.com"></label>
-    <label>SMTP port<input id="smtp_port" name="smtp_port" type="number" value="587"></label>
-    <label>SMTP security<select id="smtp_security" name="smtp_security">
-      {_option_list(security, "starttls")}</select></label>
+
+# ---------------------------------------------------------------------------
+# Accounts
+# ---------------------------------------------------------------------------
+
+
+def register_page(*, invite_required: bool = False, signed_in: bool = False) -> str:
+    """Create the first account, or add a passkey to the one you have."""
+    code_field = (
+        '<label for="code">Invite code<span class="hint">This gateway asks for one '
+        'before it will create an account.</span>'
+        '<input id="code" name="code" autocomplete="off" required></label>'
+        if invite_required
+        else ""
+    )
+    if signed_in:
+        intro = (
+            "<p>Add a second passkey so losing one device does not lock you out of "
+            "your own gateway.</p>"
+        )
+        button = "Add a passkey"
+        email_field = (
+            '<label for="email">Email<span class="hint">The account this passkey '
+            "signs in to.</span>"
+            '<input id="email" name="email" type="email" autocomplete="username webauthn" '
+            'required></label>'
+        )
+    else:
+        intro = (
+            "<p>Your account is secured by a passkey: Touch ID, Windows Hello, a "
+            "security key, or your phone. There is no password to choose or lose.</p>"
+        )
+        button = "Create my passkey"
+        email_field = (
+            '<label for="email">Email<span class="hint">Only used to tell your '
+            "accounts apart. It is never contacted.</span>"
+            '<input id="email" type="email" name="email" required '
+            'autocomplete="username webauthn" placeholder="you@example.com"></label>'
+        )
+
+    body = f"""
+{_header("Add a passkey" if signed_in else "Create your account")}
+{intro}
+<p id="err" class="status" role="alert"></p>
+<div class="card">
+  {email_field}
+  {code_field}
+  <p><button type="button" data-action="register">{esc(button)}</button></p>
+</div>
+{"" if signed_in else '<p class="muted">Already set up? <a href="/login">Sign in</a>.</p>'}
+"""
+    return page(
+        body,
+        title="Add a passkey" if signed_in else "Create your account",
+        after="/account" if signed_in else "/",
+    )
+
+
+def login_page() -> str:
+    body = f"""
+{_header("Sign in")}
+<p class="muted">Use the passkey you created when you set this gateway up.</p>
+<p id="err" class="status" role="alert"></p>
+<div class="card">
+  <p><button type="button" data-action="login">Sign in with a passkey</button></p>
+</div>
+<p class="muted">No account yet? <a href="/register">Create one</a>.</p>
+"""
+    return page(body, title="Sign in")
+
+
+def account_page(
+    email: str, credentials: list[dict[str, Any]], *, open_registration: bool = False
+) -> str:
+    """Passkeys: the page that keeps a lost device from being a lost gateway."""
+    if credentials:
+        rows = "".join(
+            f"<tr>"
+            f'<td><span class="label">Added</span>'
+            f'<span data-ts="{esc(credential["created_at"])}">{esc(credential["added"])}</span></td>'
+            f'<td><span class="label">Identifier</span><code>{esc(credential["short_id"])}</code></td>'
+            f'<td><span class="label">Last used</span>{esc(credential["last_used"])}</td>'
+            f"<td>"
+            + (
+                '<span class="muted small-text">Your only passkey</span>'
+                if len(credentials) == 1
+                else (
+                    '<form method="post" action="/account/passkeys/delete">'
+                    f'<input type="hidden" name="credential_id" value="{esc(credential["credential_id"])}">'
+                    '<button class="small danger" data-busy="Removing">Remove</button>'
+                    "</form>"
+                )
+            )
+            + "</td></tr>"
+            for credential in credentials
+        )
+        table = (
+            '<div class="table-wrap"><table class="stack">'
+            '<caption class="sr-only">Passkeys that can sign in to this account</caption>'
+            "<thead><tr><th scope=\"col\">Added</th><th scope=\"col\">Identifier</th>"
+            '<th scope="col">Last used</th><th scope="col"><span class="sr-only">Actions</span></th>'
+            f"</tr></thead><tbody>{rows}</tbody></table></div>"
+        )
+    else:
+        table = '<p class="muted">No passkey on this account yet.</p>'
+
+    warning = (
+        _notice(
+            "This is your only passkey. If you lose that device you lose access to "
+            "this gateway, and the only way back is deleting its data. Add a second "
+            "one now, on another device.",
+            "warn",
+        )
+        if len(credentials) == 1
+        else ""
+    )
+    registration = (
+        _notice(
+            "Anyone who can reach this address can create their own account here. "
+            "Set MAIL_ONBOARD_CODE to require an invite code.",
+            "warn",
+        )
+        if open_registration
+        else ""
+    )
+
+    body = f"""
+{_header("Passkeys", email, "account")}
+{warning}
+<div class="card">
+  <div class="card-head"><h2>Your passkeys</h2>
+    <a class="btn small" href="/register">Add a passkey</a></div>
+  {table}
+</div>
+<h2>This account</h2>
+<div class="card">
+  <dl class="kv">
+    <dt>Email</dt><dd>{esc(email)}</dd>
+  </dl>
+  {registration}
+  <p class="muted">Signing out does not revoke anything: your connectors keep
+  working, because they hold their own OAuth credentials.</p>
+</div>
+"""
+    return page(body, title="Passkeys", nav="")
+
+
+# ---------------------------------------------------------------------------
+# Connectors
+# ---------------------------------------------------------------------------
+
+
+def _mailbox_rows(connection: dict[str, Any]) -> str:
+    rows = []
+    for box in connection["accounts"]:
+        sends_as = box.get("sends_as") or [box["address"]]
+        identity = (
+            f'<div class="muted small-text">Sends as {esc(", ".join(sends_as))}</div>'
+            if len(sends_as) > 1 or sends_as[0] != box["address"]
+            else ""
+        )
+        default = (
+            _badge("Default", "default")
+            if box["is_default"]
+            else (
+                '<form method="post" action="/mailboxes/default">'
+                f'{_hidden({"connection_id": connection["connection_id"], "account_id": box["account_id"]})}'
+                '<button class="small secondary" data-busy="Setting">Make default</button></form>'
+            )
+        )
+        rows.append(
+            "<tr>"
+            f'<td><span class="label">Mailbox</span><strong>{esc(box["address"])}</strong>'
+            f"{identity}"
+            f'<div class="muted small-text">{esc(box["imap"])} &middot; {esc(box["smtp"])}'
+            f' &middot; {esc(box["auth"])}</div></td>'
+            f'<td><span class="label">Access</span>{access_badge(box["read_only"])}</td>'
+            f'<td><span class="label">Default</span>{default}</td>'
+            f'<td><form method="get" action="/mailboxes/remove">'
+            f'{_hidden({"connection_id": connection["connection_id"], "account_id": box["account_id"]})}'
+            '<button class="small danger">Remove</button></form></td>'
+            "</tr>"
+        )
+    if not rows:
+        return (
+            '<p class="muted">No mailbox yet. This connector cannot do anything '
+            "until it has one.</p>"
+        )
+    return (
+        '<div class="table-wrap"><table class="stack">'
+        '<caption class="sr-only">Mailboxes this connector serves</caption>'
+        '<thead><tr><th scope="col">Mailbox</th><th scope="col">Access</th>'
+        '<th scope="col">Default</th><th scope="col"><span class="sr-only">Actions</span></th>'
+        f"</tr></thead><tbody>{''.join(rows)}</tbody></table></div>"
+    )
+
+
+def _calendar_rows(connection: dict[str, Any]) -> str:
+    calendars = connection.get("calendars", [])
+    if not calendars:
+        return ""
+    rows = "".join(
+        "<tr>"
+        f'<td><span class="label">Calendar account</span><strong>{esc(calendar["address"])}</strong>'
+        f'<div class="muted small-text">{esc(calendar["url"])} &middot; '
+        f'{esc(calendar["timezone"])}</div></td>'
+        f'<td><span class="label">Access</span>{access_badge(calendar["read_only"])}</td>'
+        f'<td><form method="get" action="/calendars/remove">'
+        f'{_hidden({"connection_id": connection["connection_id"], "calendar_id": calendar["account_id"]})}'
+        '<button class="small danger">Remove</button></form></td>'
+        "</tr>"
+        for calendar in calendars
+    )
+    return (
+        '<div class="table-wrap"><table class="stack">'
+        '<caption class="sr-only">Calendar accounts this connector serves</caption>'
+        '<thead><tr><th scope="col">Calendar account</th><th scope="col">Access</th>'
+        '<th scope="col"><span class="sr-only">Actions</span></th>'
+        f"</tr></thead><tbody>{rows}</tbody></table></div>"
+    )
+
+
+def _connector_card(connection: dict[str, Any]) -> str:
+    activity = connection.get("activity") or {}
+    if activity.get("last_used"):
+        used = f'<span class="muted small-text">Last used {esc(activity["last_used"])}</span>'
+    else:
+        used = _badge("Never used", "idle")
+
+    counts = []
+    if connection["accounts"]:
+        counts.append(f"{len(connection['accounts'])} mailbox(es)")
+    if connection.get("calendars"):
+        counts.append(f"{len(connection['calendars'])} calendar(s)")
+    summary = ", ".join(counts) or "nothing attached yet"
+
+    unfinished = (
+        _notice(
+            "This connector has no mailbox and no calendar, so an agent connected "
+            "to it can do nothing. Add one below.",
+            "warn",
+        )
+        if not connection["accounts"] and not connection.get("calendars")
+        else ""
+    )
+
+    return f"""
+<section class="card" aria-labelledby="c-{esc(connection['connection_id'])}">
+  <div class="card-head">
+    <h2 id="c-{esc(connection['connection_id'])}">{esc(connection['label'] or 'Connector')}</h2>
+    <span class="muted small-text">{esc(summary)} &middot; {used}</span>
   </div>
-
-  <details id="advanced"><summary>Advanced</summary>
-    <div class="grid">
-      <label>IMAP username <small>(defaults to the address)</small>
-        <input id="imap_username" name="imap_username" autocomplete="off"></label>
-      <label>SMTP username <small>(defaults to the address)</small>
-        <input id="smtp_username" name="smtp_username" autocomplete="off"></label>
-    </div>
-    <label>Authentication<select id="auth" name="auth" onchange="onAuthChange()">
-      <option value="password">Password / app password</option>
-      <option value="xoauth2">OAuth 2 (XOAUTH2)</option></select></label>
-    <div id="oauth_fields" style="display:none">
-      <label>OAuth provider<select id="oauth_provider" name="oauth_provider">
-        <option value="google">Google</option>
-        <option value="microsoft">Microsoft</option></select></label>
-      <div class="grid">
-        <label>OAuth client ID<input id="oauth_client_id" name="oauth_client_id"
-          autocomplete="off"></label>
-        <label>OAuth client secret<input id="oauth_client_secret" type="password"
-          name="oauth_client_secret" autocomplete="off"></label>
-      </div>
-      <label>Microsoft tenant <small>(default: common)</small>
-        <input id="oauth_tenant" name="oauth_tenant" value="common"></label>
-    </div>
-    <label><input type="checkbox" id="verify_ssl" name="verify_ssl" value="1" checked>
-      Verify TLS certificates <small>(uncheck only for a local bridge)</small></label>
-    <label><input type="checkbox" name="read_only" value="1">
-      Read-only <small>(the agent can read but never send, move or delete)</small></label>
-  </details>
-
-  <div class="inline">
-    <button type="button" class="secondary" onclick="testConn()">Test connection</button>
-    <button type="submit">Add mailbox</button>
+  {unfinished}
+  {_mailbox_rows(connection)}
+  {_calendar_rows(connection)}
+  <div class="actions">
+    <a class="btn small" href="/connections/{esc(connection['connection_id'])}">Add a mailbox</a>
+    <a class="btn small secondary" href="/connections/{esc(connection['connection_id'])}/calendar">Add a calendar</a>
+    <a class="btn small secondary" href="/connections/{esc(connection['connection_id'])}/credentials">Connection details</a>
+    <form method="get" action="/connections/remove">
+      {_hidden({"connection_id": connection["connection_id"]})}
+      <button class="small danger">Delete connector</button>
+    </form>
   </div>
-</form>
-{COMMON_JS}
-{MAILBOX_JS}
-""")
+</section>"""
+
+
+def dashboard_page(
+    email: str,
+    connections: list[dict[str, Any]],
+    error: str = "",
+    notice: str = "",
+    *,
+    open_registration: bool = False,
+) -> str:
+    cards = (
+        "".join(_connector_card(connection) for connection in connections)
+        if connections
+        else """
+<div class="card">
+  <p><strong>No connector yet.</strong></p>
+  <p class="muted">A connector is one connection for one agent. It carries the
+  mailboxes and calendars that agent may use, and its own credentials, so you
+  can revoke it on its own. Create one below, then attach a mailbox to it.</p>
+</div>"""
+    )
+
+    gate = (
+        '<label for="onboard_code">Invite code<input id="onboard_code" '
+        'name="onboard_code" required autocomplete="off"></label>'
+        if open_registration is False and _invite_required()
+        else ""
+    )
+
+    body = f"""
+{_header("Your MCP connectors", email, "connectors")}
+{_notice(error, "error")}{_notice(notice, "ok")}
+{cards}
+
+<h2>New connector</h2>
+<div class="card">
+  <p class="muted">Give it a name you will recognise later. One connector per
+  agent, or per purpose, keeps revoking simple.</p>
+  <form method="post" action="/connections/new">
+    {gate}
+    <label for="label">Name<input id="label" name="label" required
+      autocomplete="off" placeholder="Claude on my laptop"></label>
+    <p><button type="submit" data-busy="Creating">Create connector</button></p>
+  </form>
+</div>
+"""
+    return page(body, title="Your connectors")
+
+
+def _invite_required() -> bool:
+    import os
+
+    return bool(os.environ.get("MAIL_ONBOARD_CODE"))
 
 
 def credentials_page(
-    base_url: str, connection: dict[str, Any], client_secret: str
+    base_url: str,
+    connection: dict[str, Any],
+    client_secret: str,
+    *,
+    fresh: bool = False,
 ) -> str:
+    """What to paste into the agent. Not one-shot: the secret is recoverable."""
     redirects = ", ".join(esc(uri) for uri in connection.get("redirect_uris", []))
-    return page(f"""
-<h1>Connector ready</h1>
-<p>In Claude, open <b>Settings &rarr; Connectors &rarr; Add custom connector</b>
-and enter:</p>
-<div class="card">
-  <div class="row"><b>MCP server URL</b><br><code>{esc(base_url)}/mcp</code></div>
-  <div class="row"><b>OAuth client ID</b><br><code>{esc(connection['client_id'])}</code></div>
-  <div class="row"><b>OAuth client secret</b><br><code>{esc(client_secret)}</code></div>
-</div>
-<p class="muted">Copy the secret now: it is not shown again (you can issue a new
-one from the dashboard). Authorized redirects: {redirects}.</p>
-<p><a href="/connections/{esc(connection['connection_id'])}">Add a mailbox to this
-connector</a> &middot; <a href="/">Back to your connectors</a></p>
-""")
-
-
-LOGS_JS = """
-<script>
-// Timestamps are rendered in UTC; show them in the reader's own timezone.
-for (const cell of document.querySelectorAll('[data-ts]')) {
-  const ms = Number(cell.getAttribute('data-ts')) * 1000;
-  if (!Number.isNaN(ms)) cell.textContent = new Date(ms).toLocaleString();
-}
-</script>
-"""
-
-
-def _select(name: str, options: list[tuple[str, str]], selected: str) -> str:
-    return (
-        f'<select name="{esc(name)}" onchange="this.form.submit()">'
-        + _option_list(options, selected)
-        + "</select>"
+    intro = (
+        "<p>Your connector is ready. In Claude, open <strong>Settings &rarr; "
+        "Connectors &rarr; Add custom connector</strong> and paste these three "
+        "values.</p>"
+        if fresh
+        else "<p>Paste these into the agent's custom-connector dialog.</p>"
     )
+    body = f"""
+{_header(connection['label'] or 'Connector', connection.get('email', ''), 'connectors')}
+{intro}
+<div class="card">
+  <dl class="kv">
+    <dt><label for="mcp-url">MCP server URL</label></dt>
+    <dd><div class="secret"><code id="mcp-url">{esc(base_url)}/mcp</code>
+      <button class="small secondary" type="button" data-action="copy" data-copy="mcp-url">Copy</button></div></dd>
+    <dt><label for="client-id">OAuth client ID</label></dt>
+    <dd><div class="secret"><code id="client-id">{esc(connection['client_id'])}</code>
+      <button class="small secondary" type="button" data-action="copy" data-copy="client-id">Copy</button></div></dd>
+    <dt><label for="client-secret">OAuth client secret</label></dt>
+    <dd><div class="secret"><code id="client-secret">{esc(client_secret)}</code>
+      <button class="small secondary" type="button" data-action="copy" data-copy="client-secret">Copy</button></div></dd>
+  </dl>
+  <p id="copy-status" class="status" role="status" aria-live="polite"></p>
+  <p class="muted">You can come back to this page whenever you need it. If the
+  secret has leaked, issue a new one below: the agent will have to reconnect.</p>
+  <div class="actions">
+    <a class="btn secondary" href="/">Back to connectors</a>
+    <a class="btn small" href="/connections/{esc(connection['connection_id'])}">Add a mailbox</a>
+    <form method="get" action="/connections/rotate">
+      {_hidden({"connection_id": connection["connection_id"]})}
+      <button class="small danger">Issue a new secret</button>
+    </form>
+  </div>
+</div>
+<p class="muted">Authorized redirect URLs: {redirects or "(none configured)"}.</p>
+"""
+    return page(body, title=f"{connection['label'] or 'Connector'} details")
+
+
+def confirm_page(
+    *,
+    title: str,
+    question: str,
+    detail: str,
+    action: str,
+    fields: dict[str, str],
+    confirm_label: str,
+    email: str = "",
+    cancel: str = "/",
+) -> str:
+    """Server-rendered confirmation for anything destructive.
+
+    A ``confirm()`` dialog is not a guard: it needs scripting, and putting the
+    name of the thing inside a JavaScript string in an attribute is how
+    escaping bugs happen. This page works with scripting off and puts no data
+    in a script context.
+    """
+    body = f"""
+{_header(title, email)}
+<div class="card">
+  <p><strong>{esc(question)}</strong></p>
+  <p class="muted">{esc(detail)}</p>
+  <form method="post" action="{esc(action)}">
+    {_hidden({**fields, "confirm": "yes"})}
+    <div class="actions">
+      <button class="danger" type="submit" data-busy="Working">{esc(confirm_label)}</button>
+      <a class="btn secondary" href="{esc(cancel)}">Cancel, keep it</a>
+    </div>
+  </form>
+</div>
+"""
+    return page(body, title=title)
+
+
+# ---------------------------------------------------------------------------
+# Mailbox and calendar forms
+# ---------------------------------------------------------------------------
+
+
+def _value(values: dict[str, Any] | None, name: str, default: str = "") -> str:
+    if not values:
+        return esc(default)
+    raw = values.get(name)
+    if raw is None or raw == "":
+        return esc(default)
+    return esc(raw)
+
+
+def _checked(values: dict[str, Any] | None, name: str, default: bool = False) -> str:
+    if values is None:
+        return " checked" if default else ""
+    return " checked" if values.get(name) else ""
+
+
+def mailbox_form_page(
+    connection: dict[str, Any], error: str = "", values: dict[str, Any] | None = None
+) -> str:
+    """Attach a mailbox. Everything typed survives a failed attempt but the password."""
+    lost_password = (
+        '<p class="muted">Your password was not kept, so type it again. Everything '
+        "else is as you left it.</p>"
+        if error and values
+        else ""
+    )
+    body = f"""
+{_header("Add a mailbox", connection.get("email", ""), "connectors")}
+<p class="muted">Connector: <strong>{esc(connection['label'])}</strong></p>
+{_notice(error, "error")}{lost_password}
+<form method="post" action="/connections/{esc(connection['connection_id'])}/mailboxes">
+  <div class="card">
+    <label for="address">Email address<span class="hint">The mailbox the agent
+      will read and send from.</span></label>
+    <div class="row">
+      <input id="address" name="address" type="email" required autocomplete="email"
+        placeholder="you@example.com" value="{_value(values, 'address')}">
+      <button type="button" class="secondary" data-action="detect">Detect settings</button>
+    </div>
+
+    <label for="secret" id="secret_label"><span id="secret_label_text">Password or app
+      password</span></label>
+    <input id="secret" name="secret" type="password" required autocomplete="off">
+    <p id="provider_note" class="status" role="status"{"" if values and values.get("provider_note") else " hidden"}>
+      {_value(values, "provider_note")}</p>
+    <p class="muted">Most providers refuse your normal password here and want an
+      app password: Gmail, iCloud, Fastmail and Yahoo all do.</p>
+    <p id="probe" class="status" role="status" aria-live="polite"></p>
+  </div>
+
+  <div class="card">
+    <h2>Servers</h2>
+    <div class="grid">
+      <label for="imap_host">IMAP server<input id="imap_host" name="imap_host" required
+        placeholder="imap.example.com" value="{_value(values, 'imap_host')}"></label>
+      <label for="imap_port">IMAP port<input id="imap_port" name="imap_port" type="number"
+        min="1" max="65535" value="{_value(values, 'imap_port', '993')}"></label>
+      <label for="imap_security">IMAP security<select id="imap_security" name="imap_security">
+        {_option_list(SECURITY_CHOICES, (values or {}).get("imap_security", "ssl"))}</select></label>
+      <label for="smtp_host">SMTP server<input id="smtp_host" name="smtp_host" required
+        placeholder="smtp.example.com" value="{_value(values, 'smtp_host')}"></label>
+      <label for="smtp_port">SMTP port<input id="smtp_port" name="smtp_port" type="number"
+        min="1" max="65535" value="{_value(values, 'smtp_port', '587')}"></label>
+      <label for="smtp_security">SMTP security<select id="smtp_security" name="smtp_security">
+        {_option_list(SECURITY_CHOICES, (values or {}).get("smtp_security", "starttls"))}</select></label>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Identity</h2>
+    <label for="from_name">Display name<span class="hint">Optional, shown in the
+      From header.</span><input id="from_name" name="from_name" autocomplete="off"
+      placeholder="Ada Lovelace" value="{_value(values, 'from_name')}"></label>
+    <label for="from_address">Send from<span class="hint">Optional. Set this when mail
+      should go out as another address, such as an iCloud+ custom domain.</span>
+      <input id="from_address" name="from_address" type="email" autocomplete="off"
+      placeholder="you@your-domain.com" value="{_value(values, 'from_address')}"></label>
+    <label for="aliases">Other sending addresses<span class="hint">Optional,
+      comma-separated. The agent may only send as one of these.</span>
+      <input id="aliases" name="aliases" autocomplete="off"
+      placeholder="contact@your-domain.com, billing@your-domain.com"
+      value="{_value(values, 'aliases')}"></label>
+  </div>
+
+  <fieldset class="scope">
+    <legend>What the agent may do with this mailbox</legend>
+    <label class="check" for="read_only">
+      <input type="checkbox" id="read_only" name="read_only" value="1"{_checked(values, "read_only")}>
+      <span><strong>Read only.</strong> The agent can read and search this mailbox,
+      but never send, move or delete. Leave this off and it can do all of that.</span>
+    </label>
+  </fieldset>
+
+  <details id="advanced">
+    <summary>Advanced</summary>
+    <div class="grid">
+      <label for="imap_username">IMAP username<span class="hint">Defaults to the
+        address.</span><input id="imap_username" name="imap_username" autocomplete="off"
+        value="{_value(values, 'imap_username')}"></label>
+      <label for="smtp_username">SMTP username<span class="hint">Defaults to the
+        address.</span><input id="smtp_username" name="smtp_username" autocomplete="off"
+        value="{_value(values, 'smtp_username')}"></label>
+    </div>
+    <label for="auth">Authentication<select id="auth" name="auth">
+      <option value="password"{" selected" if (values or {}).get("auth") != "xoauth2" else ""}>
+        Password or app password</option>
+      <option value="xoauth2"{" selected" if (values or {}).get("auth") == "xoauth2" else ""}>
+        OAuth 2 (XOAUTH2)</option>
+    </select></label>
+    <div id="oauth_fields" data-js-hidden="1">
+      <label for="oauth_provider">OAuth provider<select id="oauth_provider" name="oauth_provider">
+        {_option_list([("google", "Google"), ("microsoft", "Microsoft")],
+                      (values or {}).get("oauth_provider", "google"))}</select></label>
+      <div class="grid">
+        <label for="oauth_client_id">OAuth client ID<input id="oauth_client_id"
+          name="oauth_client_id" autocomplete="off"
+          value="{_value(values, 'oauth_client_id')}"></label>
+        <label for="oauth_client_secret">OAuth client secret<input id="oauth_client_secret"
+          name="oauth_client_secret" type="password" autocomplete="off"></label>
+      </div>
+      <label for="oauth_tenant">Microsoft tenant<span class="hint">Defaults to
+        common.</span><input id="oauth_tenant" name="oauth_tenant"
+        value="{_value(values, 'oauth_tenant', 'common')}"></label>
+    </div>
+    <label class="check" for="verify_ssl">
+      <input type="checkbox" id="verify_ssl" name="verify_ssl" value="1"{_checked(values, "verify_ssl", True)}>
+      <span>Verify TLS certificates. Turn this off only for a local bridge such as
+      Proton Mail Bridge.</span>
+    </label>
+  </details>
+
+  <div class="actions">
+    <button type="button" class="secondary" data-action="test-mailbox">Test connection</button>
+    <button type="submit" data-busy="Checking and saving">Add mailbox</button>
+  </div>
+  <p class="muted">The mailbox is saved only once IMAP and SMTP have both
+  answered, so a wrong password cannot be stored silently.</p>
+</form>
+"""
+    return page(body, title="Add a mailbox")
+
+
+def calendar_form_page(
+    connection: dict[str, Any], error: str = "", values: dict[str, Any] | None = None
+) -> str:
+    lost_password = (
+        '<p class="muted">Your password was not kept, so type it again. Everything '
+        "else is as you left it.</p>"
+        if error and values
+        else ""
+    )
+    body = f"""
+{_header("Add a calendar", connection.get("email", ""), "connectors")}
+<p class="muted">Connector: <strong>{esc(connection['label'])}</strong></p>
+{_notice(error, "error")}{lost_password}
+<form method="post" action="/connections/{esc(connection['connection_id'])}/calendars">
+  <div class="card">
+    <label for="address">Account address<span class="hint">The account the
+      calendars belong to.</span>
+      <input id="address" name="address" type="email" required autocomplete="email"
+        placeholder="you@icloud.com" value="{_value(values, 'address')}"></label>
+    <label for="secret">Password<input id="secret" name="secret" type="password"
+      required autocomplete="off"></label>
+    <p class="muted">Apple iCloud needs an <strong>app-specific password</strong>
+      (appleid.apple.com &rarr; Sign-In and Security), not your Apple ID password.
+      The server address is known for iCloud, Fastmail and Google.</p>
+    <p id="probe" class="status" role="status" aria-live="polite"></p>
+  </div>
+
+  <div class="card">
+    <h2>Server</h2>
+    <div class="grid">
+      <label for="url">CalDAV URL<span class="hint">Optional for known
+        providers.</span><input id="url" name="url" autocomplete="off"
+        placeholder="https://caldav.example.com" value="{_value(values, 'url')}"></label>
+      <label for="username">Username<span class="hint">Defaults to the
+        address.</span><input id="username" name="username" autocomplete="off"
+        value="{_value(values, 'username')}"></label>
+      <label for="timezone">Timezone<span class="hint">How times written without an
+        offset are read. Use your own, e.g. Europe/Paris or America/Chicago.</span>
+        <input id="timezone" name="timezone" required placeholder="Europe/Paris"
+        value="{_value(values, 'timezone')}"></label>
+      <label for="default_calendar">Default calendar<span class="hint">Optional; the
+        first one is used otherwise.</span>
+        <input id="default_calendar" name="default_calendar" autocomplete="off"
+        placeholder="Personal" value="{_value(values, 'default_calendar')}"></label>
+    </div>
+    <label for="default_calendar_pick" id="default_calendar_pick_label" data-js-hidden="1">
+      Calendars found<span class="hint">Pick one to use as the default.</span>
+      <select id="default_calendar_pick"></select></label>
+  </div>
+
+  <fieldset class="scope">
+    <legend>What the agent may do with these calendars</legend>
+    <label class="check" for="read_only">
+      <input type="checkbox" id="read_only" name="read_only" value="1"{_checked(values, "read_only")}>
+      <span><strong>Read only.</strong> The agent can read events and find free time,
+      but never create, change, delete or answer invitations.</span>
+    </label>
+  </fieldset>
+
+  <div class="actions">
+    <button type="button" class="secondary" data-action="test-calendar">Test connection</button>
+    <button type="submit" data-busy="Checking and saving">Add calendar</button>
+  </div>
+  <p class="muted">The calendar is saved only once the server has answered.</p>
+</form>
+"""
+    return page(body, title="Add a calendar")
+
+
+# ---------------------------------------------------------------------------
+# Activity log
+# ---------------------------------------------------------------------------
 
 
 def logs_page(
@@ -473,12 +756,11 @@ def logs_page(
     filters: dict[str, str],
     limit: int,
     truncated: bool = False,
+    filtered: bool = False,
 ) -> str:
-    """The activity view: every MCP tool call this user's connectors served."""
+    """Every tool call the agents made, scoped to this user's connectors."""
     tool_options = [("", "All tools")] + [(t, t) for t in stats.get("tools", [])]
-    account_options = [("", "All mailboxes")] + [
-        (a, a) for a in stats.get("accounts", [])
-    ]
+    account_options = [("", "All accounts")] + [(a, a) for a in stats.get("accounts", [])]
     connection_options = [("", "All connectors"), *connections]
     status_options = [
         ("", "Any outcome"),
@@ -494,153 +776,93 @@ def logs_page(
                 f"{key}={value}" for key, value in (entry["arguments"] or {}).items()
             )
             detail = (
-                f'<div class="args">{esc(entry["detail"])}</div>'
+                f'<div class="muted small-text">{esc(entry["detail"])}</div>'
                 if entry["detail"]
                 else ""
             )
+            outcome = {
+                "ok": ("Succeeded", "read"),
+                "error": ("Failed", "write"),
+                "denied": ("Refused", "idle"),
+            }.get(entry["status"], ("Failed", "write"))
             rows.append(
-                f"<tr>"
-                f'<td style="white-space:nowrap" data-ts="{esc(entry["ts"])}">'
-                f'{esc(entry["when"])}</td>'
-                f'<td><code>{esc(entry["tool"])}</code>'
-                + (f'<div class="args">{esc(arguments)}</div>' if arguments else "")
+                "<tr>"
+                f'<td><span class="label">When</span>'
+                f'<span data-ts="{esc(entry["ts"])}">{esc(entry["when"])}</span></td>'
+                f'<td><span class="label">Action</span><code>{esc(entry["tool"])}</code>'
+                + (
+                    f'<div class="muted small-text">{esc(arguments)}</div>'
+                    if arguments
+                    else ""
+                )
                 + detail
                 + "</td>"
-                f'<td>{esc(entry["account"] or "-")}<div class="args">'
+                f'<td><span class="label">Account</span>{esc(entry["account"] or "-")}'
+                f'<div class="muted small-text">'
                 f'{esc(entry["connection_label"] or entry["connection_id"])}</div></td>'
-                f'<td><span class="pill {esc(entry["status"])}">'
-                f'{esc(entry["status"])}</span></td>'
-                f'<td style="white-space:nowrap">{esc(entry["duration_ms"])} ms</td>'
-                f"</tr>"
+                f'<td><span class="label">Outcome</span>{_badge(outcome[0], outcome[1])}</td>'
+                f'<td><span class="label">Took</span>{esc(entry["duration_ms"])} ms</td>'
+                "</tr>"
             )
         table = (
-            '<table class="logs"><tr><th>When</th><th>Action</th>'
-            "<th>Mailbox</th><th>Outcome</th><th>Took</th></tr>"
-            + "".join(rows)
-            + "</table>"
+            '<div class="table-wrap"><table class="logs stack">'
+            '<caption class="sr-only">Tool calls, most recent first</caption>'
+            '<thead><tr><th scope="col">When</th><th scope="col">Action</th>'
+            '<th scope="col">Account</th><th scope="col">Outcome</th>'
+            '<th scope="col">Took</th></tr></thead>'
+            f"<tbody>{''.join(rows)}</tbody></table></div>"
         )
         note = (
-            f'<p class="muted">Showing the {len(entries)} most recent of the last '
+            f'<p class="muted">Showing the {len(entries)} most recent of '
             f"{stats.get('total', 0)} recorded calls. Raise the limit to see more.</p>"
             if truncated
             else f'<p class="muted">{len(entries)} call(s).</p>'
         )
+    elif filtered:
+        table = (
+            '<p><strong>No call matches these filters.</strong></p>'
+            '<p class="muted">There are still '
+            f"{esc(stats.get('total', 0))} recorded calls.</p>"
+            '<p><a class="btn secondary" href="/logs">Clear filters</a></p>'
+        )
+        note = ""
     else:
         table = (
-            "<p class='muted'>Nothing recorded yet. Every tool call an agent makes "
-            "through your connectors shows up here.</p>"
+            "<p><strong>Nothing recorded yet.</strong></p>"
+            '<p class="muted">Every tool call an agent makes through your connectors '
+            "shows up here: what it ran, on which mailbox, and how it went.</p>"
         )
         note = ""
 
-    return page(f"""
-<div class="top"><h1>Activity log</h1>
-  <span class="muted">{esc(email)} &middot; <a href="/">Connectors</a>
-    &middot; <a href="/logout">Sign out</a></span></div>
-
+    body = f"""
+{_header("Activity", email, "logs")}
 <div class="card">
   <div class="stats">
-    <span><b>{esc(stats.get('total', 0))}</b> recorded calls</span>
-    <span><b>{esc(stats.get('last_24h', 0))}</b> in the last 24h</span>
-    <span><b>{esc(stats.get('errors', 0))}</b> failed or refused</span>
+    <div><b>{esc(stats.get('total', 0))}</b><span>recorded calls</span></div>
+    <div><b>{esc(stats.get('last_24h', 0))}</b><span>in the last 24 hours</span></div>
+    <div><b>{esc(stats.get('errors', 0))}</b><span>failed or refused</span></div>
   </div>
 </div>
 
 <form method="get" action="/logs" class="card filters">
-  <label>Connector<br>{_select("connection_id", connection_options,
-                               filters.get("connection_id", ""))}</label>
-  <label>Mailbox<br>{_select("account", account_options, filters.get("account", ""))}</label>
-  <label>Tool<br>{_select("tool", tool_options, filters.get("tool", ""))}</label>
-  <label>Outcome<br>{_select("status", status_options, filters.get("status", ""))}</label>
-  <label>Limit<br><input type="number" name="limit" value="{esc(limit)}" min="1"
-    max="1000" style="min-width:6rem"></label>
+  <label for="f_connection">Connector<select id="f_connection" name="connection_id">
+    {_option_list(connection_options, filters.get("connection_id", ""))}</select></label>
+  <label for="f_account">Account<select id="f_account" name="account">
+    {_option_list(account_options, filters.get("account", ""))}</select></label>
+  <label for="f_tool">Tool<select id="f_tool" name="tool">
+    {_option_list(tool_options, filters.get("tool", ""))}</select></label>
+  <label for="f_status">Outcome<select id="f_status" name="status">
+    {_option_list(status_options, filters.get("status", ""))}</select></label>
+  <label for="f_limit">Limit<input id="f_limit" type="number" name="limit"
+    value="{esc(limit)}" min="1" max="1000"></label>
   <button type="submit">Apply</button>
-  <a href="/logs"><button type="button" class="secondary">Reset</button></a>
+  <a class="btn secondary" href="/logs">Reset</a>
 </form>
 
 {note}
 <div class="card">{table}</div>
-<p class="muted">Message bodies, attachments and credentials are never recorded.
-Subjects, recipients, folders and UIDs are, so the log can answer what was sent
-and to whom.</p>
-{LOGS_JS}
-""")
-
-
-CALENDAR_JS = """
-<script>
-function calendarPayload(){
- return {address:val('address'),secret:val('secret'),url:val('url'),
-  username:val('username'),timezone:val('timezone'),
-  default_calendar:val('default_calendar')};
-}
-async function testCalendar(){
- const e=document.getElementById('probe');
- e.className='muted';e.textContent='Connecting to the CalDAV server...';
- try{
-  const j=await postJSON('/test-calendar',calendarPayload());
-  e.className=j.ok?'ok':'err';
-  e.textContent=j.message;
-  if(j.ok&&j.calendars&&j.calendars.length){
-   const sel=document.getElementById('default_calendar_pick');
-   sel.innerHTML='';
-   const none=document.createElement('option');
-   none.value='';none.textContent='(first calendar)';sel.appendChild(none);
-   for(const c of j.calendars){const o=document.createElement('option');
-    o.value=c.name;o.textContent=c.name+(c.read_only?' (read-only)':'');sel.appendChild(o);}
-   sel.style.display='block';
-   sel.onchange=function(){document.getElementById('default_calendar').value=this.value;};
-  }
- }catch(x){e.className='err';e.textContent=x.message;}
-}
-</script>
+<p class="muted">Subjects, recipients, folders and UIDs are recorded, so this can
+answer what was sent and to whom. Message bodies, attachments and credentials
+never are.</p>
 """
-
-
-def calendar_form_page(connection: dict[str, Any], error: str = "") -> str:
-    """The form that attaches a CalDAV account to a connector."""
-    error_html = f'<p class="err">{esc(error)}</p>' if error else ""
-    return page(f"""
-<div class="top"><h1>Add a calendar</h1>
-  <span class="muted"><a href="/">Back to connectors</a></span></div>
-<p class="muted">Connector: <b>{esc(connection['label'])}</b></p>
-{error_html}
-<form method="post" action="/connections/{esc(connection['connection_id'])}/calendars"
-      class="card">
-  <label>Account address
-    <input id="address" name="address" type="email" required
-           placeholder="you@icloud.com"></label>
-  <label>Password
-    <input id="secret" name="secret" type="password" required autocomplete="off"></label>
-  <p class="muted">Apple iCloud needs an <b>app-specific password</b>
-    (appleid.apple.com &rarr; Sign-In and Security), not your Apple ID password.
-    The CalDAV server is filled in automatically for iCloud, Fastmail and
-    Google; enter it for anything else.</p>
-  <p id="probe" class="muted"></p>
-
-  <div class="grid">
-    <label>CalDAV URL <small>(optional for known providers)</small>
-      <input id="url" name="url" autocomplete="off"
-             placeholder="https://caldav.example.com"></label>
-    <label>Username <small>(defaults to the address)</small>
-      <input id="username" name="username" autocomplete="off"></label>
-    <label>Timezone <small>(how times without an offset are read)</small>
-      <input id="timezone" name="timezone" value="Europe/Paris"></label>
-    <label>Default calendar <small>(optional)</small>
-      <input id="default_calendar" name="default_calendar" autocomplete="off"
-             placeholder="Personal">
-      <select id="default_calendar_pick" style="display:none;margin-top:.3rem"></select>
-    </label>
-  </div>
-  <label><input type="checkbox" name="read_only" value="1">
-    Read-only <small>(the agent can read events but never create, change or
-    delete them)</small></label>
-
-  <div class="inline">
-    <button type="button" class="secondary" onclick="testCalendar()">Test connection</button>
-    <button type="submit">Add calendar</button>
-  </div>
-</form>
-{COMMON_JS}
-{MAILBOX_JS}
-{CALENDAR_JS}
-""")
+    return page(body, title="Activity")
