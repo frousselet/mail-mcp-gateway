@@ -16,6 +16,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from typing import Any
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 _ADDRESS_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
@@ -78,8 +79,17 @@ class CalendarAccount:
             raise CalendarConfigError(
                 "No CalDAV server known for this domain. Enter the server URL."
             )
-        if not url.startswith(("http://", "https://")):
-            raise CalendarConfigError("The CalDAV URL must start with https://.")
+        if not url.startswith("https://"):
+            # The password travels in every request (HTTP Basic): over plain
+            # http it is readable by anyone on the path. Only a server on this
+            # very machine may be reached that way.
+            host = (urlsplit(url).hostname or "").lower()
+            local = host in ("localhost", "127.0.0.1", "::1")
+            if not (url.startswith("http://") and local):
+                raise CalendarConfigError(
+                    "The CalDAV URL must start with https:// (plain http is only "
+                    "accepted for a server on localhost)."
+                )
         try:
             ZoneInfo(self.timezone or "UTC")
         except (ZoneInfoNotFoundError, ValueError) as e:

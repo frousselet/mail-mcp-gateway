@@ -21,9 +21,11 @@ import logging
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 
+from mail_mcp import netguard
 from mail_mcp.accounts import SECURITY_NONE, SECURITY_SSL, SECURITY_STARTTLS
 
 logger = logging.getLogger("mail-mcp.discovery")
@@ -211,7 +213,9 @@ async def discover(email: str, timeout: float = 6.0) -> ServerSettings | None:
     """Look up settings for ``email``; returns ``None`` when nothing is found."""
     address = email.strip()
     domain = address.rpartition("@")[2].lower()
-    if not domain:
+    # The domain is formatted into URLs the gateway fetches: a port, a path or
+    # an IP literal in it would aim those requests somewhere else entirely.
+    if not netguard.valid_domain(domain):
         return None
 
     preset = preset_for(domain)
@@ -219,13 +223,23 @@ async def discover(email: str, timeout: float = 6.0) -> ServerSettings | None:
         return preset
 
     urls = [ISPDB_URL.format(domain=domain)] + [
-        url.format(domain=domain, email=address) for url in DOMAIN_AUTOCONFIG_URLS
+        url.format(domain=domain, email=quote(address, safe="@"))
+        for url in DOMAIN_AUTOCONFIG_URLS
     ]
-    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+    async def _guard(request: httpx.Request) -> None:
+        # Runs for every hop, redirects included.
+        await netguard.acheck_host(request.url.host)
+
+    async with httpx.AsyncClient(
+        timeout=timeout,
+        follow_redirects=True,
+        max_redirects=3,
+        event_hooks={"request": [_guard]},
+    ) as client:
         for url in urls:
             try:
                 response = await client.get(url)
-            except httpx.HTTPError as e:
+            except (httpx.HTTPError, netguard.TargetError) as e:
                 logger.debug("autoconfig lookup failed for %s: %s", url, e)
                 continue
             if response.status_code != 200 or not response.text.strip():

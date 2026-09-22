@@ -63,6 +63,9 @@ class FakeCalDAVState:
         self.stale_report_etags = False
         # conflict_puts: the next N conditional writes lose a race.
         self.conflict_puts = 0
+        # redirect_writes: PUT and DELETE answer 302 to this path, as a server
+        # that moved a collection (or upgrades http to https) does.
+        self.redirect_writes = ""
 
     def calendar_of(self, path: str) -> FakeCalendar | None:
         for href, calendar in self.calendars.items():
@@ -203,7 +206,9 @@ def _report(state: FakeCalDAVState, path: str, body: str) -> Response:
     for href, (ics, etag) in calendar.entries.items():
         if uid and f"UID:{uid}".encode() not in ics:
             continue
-        if window:
+        if window and b"RRULE" not in ics:
+            # A recurring event matches when any occurrence does; like a real
+            # server, it is then returned whole and unexpanded.
             start, end = _event_window(ics)
             if end < window[0].replace("T", "") or start > window[1].replace("T", ""):
                 continue
@@ -227,7 +232,15 @@ def _get(state: FakeCalDAVState, path: str) -> Response:
     return Response(ics, media_type="text/calendar", headers={"ETag": etag})
 
 
+def _redirect(state: FakeCalDAVState) -> Response | None:
+    if not state.redirect_writes:
+        return None
+    return Response(status_code=302, headers={"Location": state.redirect_writes})
+
+
 def _put(state: FakeCalDAVState, path: str, ics: bytes, headers) -> Response:
+    if (moved := _redirect(state)) is not None:
+        return moved
     calendar = state.calendar_of(path)
     if calendar is None:
         return PlainTextResponse("No such calendar", status_code=404)
@@ -255,6 +268,8 @@ def _put(state: FakeCalDAVState, path: str, ics: bytes, headers) -> Response:
 
 
 def _delete(state: FakeCalDAVState, path: str, headers) -> Response:
+    if (moved := _redirect(state)) is not None:
+        return moved
     calendar = state.calendar_of(path)
     if calendar is None or path not in calendar.entries:
         return PlainTextResponse("Not found", status_code=404)

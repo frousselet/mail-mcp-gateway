@@ -18,15 +18,23 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, date, datetime, time
 from typing import Any
 from urllib.parse import urljoin, urlparse
 from xml.etree import ElementTree as ET
 
 import httpx
 
+from mail_mcp import netguard
 from mail_mcp.calendars import CalendarAccount
-from mail_mcp.events import EventRecord, caldav_stamp, parse_events
+from mail_mcp.events import (
+    EventRecord,
+    caldav_stamp,
+    expand_events,
+    master_of,
+    parse_events,
+    zone,
+)
 
 logger = logging.getLogger("mail-mcp.caldav")
 
@@ -144,8 +152,12 @@ class CalDavClient:
             timeout=account.timeout,
             verify=account.verify_ssl,
             follow_redirects=True,
+            max_redirects=5,
             transport=transport,
             headers={"User-Agent": "mail-mcp-gateway/0.1 CalDAV"},
+            # Every hop, redirects included, is checked against the network
+            # policy before the request (and its credentials) leaves.
+            event_hooks={"request": [_guard]},
         )
         self._home: str = account.discovered_home or ""
         self._calendars: list[CalendarInfo] | None = None
@@ -173,14 +185,33 @@ class CalDavClient:
         expected: tuple[int, ...] = (200, 201, 204, 207),
         what: str = "request",
     ) -> httpx.Response:
+        # A 302 or 303 turns a PUT or DELETE into a GET (that is what the
+        # status codes mean), which then answers 200: the write would be
+        # reported as done without having happened. Writes do not follow.
+        writes = method in ("PUT", "DELETE")
         try:
             response = await self._client.request(
-                method, url, content=body, headers=headers or {}
+                method,
+                url,
+                content=body,
+                headers=headers or {},
+                follow_redirects=not writes,
             )
+        except netguard.TargetError as e:
+            raise CalDavError(str(e)) from e
         except httpx.HTTPError as e:
             raise CalDavError(
                 f"Cannot reach the CalDAV server at {url}.", detail=str(e)
             ) from e
+
+        if writes and 300 <= response.status_code < 400:
+            raise CalDavError(
+                f"The CalDAV server redirected the {what} elsewhere, so nothing "
+                "was written.",
+                detail=f"HTTP {response.status_code} to "
+                f"{response.headers.get('Location', '?')}. Check the calendar URL.",
+                status=response.status_code,
+            )
 
         if response.status_code in (401, 403):
             raise CalDavError(
@@ -202,9 +233,15 @@ class CalDavClient:
                 "That calendar or event no longer exists on the server.", status=404
             )
         if response.status_code not in expected:
+            # The body stays in the log: echoing it would let a connection
+            # test read whatever page sits at the URL.
+            logger.debug(
+                "CalDAV %s %s -> %s: %s", method, url, response.status_code,
+                response.text[:500],
+            )
             raise CalDavError(
                 f"The CalDAV server refused the {what}.",
-                detail=f"HTTP {response.status_code}: {response.text[:200]}",
+                detail=f"HTTP {response.status_code}.",
                 status=response.status_code,
             )
         return response
@@ -350,7 +387,10 @@ class CalDavClient:
     # --- reading -------------------------------------------------------------
 
     def _parse_multistatus(
-        self, response: httpx.Response, calendar: CalendarInfo
+        self,
+        response: httpx.Response,
+        calendar: CalendarInfo,
+        window: tuple[datetime, datetime] | None = None,
     ) -> list[EventRecord]:
         records: list[EventRecord] = []
         for entry in self._tree(response).findall(".//d:response", NS):
@@ -359,18 +399,21 @@ class CalDavClient:
             if href_node is None or data_node is None or not data_node.text:
                 continue
             etag_node = entry.find(".//d:getetag", NS)
-            records += parse_events(
-                data_node.text,
-                href=href_node.text.strip(),
-                etag=usable_etag(etag_node.text or "") if etag_node is not None else "",
-                calendar=calendar.name,
-            )
+            options = {
+                "href": href_node.text.strip(),
+                "etag": usable_etag(etag_node.text or "") if etag_node is not None else "",
+                "calendar": calendar.name,
+            }
+            if window is not None:
+                records += expand_events(data_node.text, *window, **options)
+            else:
+                records += parse_events(data_node.text, **options)
         return records
 
     async def events_between(
         self, start: datetime, end: datetime, *, calendar: str | None = None
     ) -> tuple[list[EventRecord], CalendarInfo]:
-        """Events overlapping a time range, as the server reports them."""
+        """Occurrences overlapping a time range, recurring events expanded."""
         target = await self.resolve_calendar(calendar)
         body = _REPORT_TIME_RANGE.format(
             start=caldav_stamp(start), end=caldav_stamp(end)
@@ -382,8 +425,9 @@ class CalDavClient:
             headers={"Depth": "1", "Content-Type": "application/xml; charset=utf-8"},
             what="event query",
         )
-        records = self._parse_multistatus(response, target)
-        records.sort(key=lambda r: _sort_key(r))
+        records = self._parse_multistatus(response, target, window=(start, end))
+        tz = zone(self.account.timezone)
+        records.sort(key=lambda r: _sort_key(r, tz))
         return records, target
 
     async def find_by_uid(
@@ -399,8 +443,18 @@ class CalDavClient:
             headers={"Depth": "1", "Content-Type": "application/xml; charset=utf-8"},
             what="event lookup",
         )
-        records = self._parse_multistatus(response, target)
-        return (records[0] if records else None), target
+        # text-match is a substring match (RFC 4791 9.7.5): "abc" also finds
+        # "xabcx". Only an exact UID counts, and two resources claiming the
+        # same one is a question for the caller, not a coin toss.
+        records = [r for r in self._parse_multistatus(response, target) if r.uid == uid]
+        hrefs = {r.href for r in records}
+        if len(hrefs) > 1:
+            raise CalDavError(
+                f"{len(hrefs)} entries in {target.name!r} carry the UID {uid}, so "
+                "I will not guess which one you mean.",
+                detail="Fix the duplicate in a calendar app.",
+            )
+        return master_of(records), target
 
     async def fetch(self, href: str, calendar: str = "") -> EventRecord:
         """Read one calendar resource by its href."""
@@ -413,9 +467,10 @@ class CalDavClient:
             etag=usable_etag(response.headers.get("ETag", "")),
             calendar=calendar,
         )
-        if not records:
+        master = master_of(records)
+        if master is None:
             raise CalDavError("That calendar entry holds no event.")
-        return records[0]
+        return master
 
     # --- writing -------------------------------------------------------------
 
@@ -539,11 +594,22 @@ class CalDavClient:
         )
 
 
-def _sort_key(record: EventRecord):
+async def _guard(request: httpx.Request) -> None:
+    await netguard.acheck_host(request.url.host)
+
+
+def _sort_key(record: EventRecord, tz) -> tuple[int, datetime]:
+    """Order all-day and timed events on one clock: the account's."""
     start = record.start
     if start is None:
-        return (1, "")
-    return (0, start.isoformat() if hasattr(start, "isoformat") else str(start))
+        return (1, datetime.min.replace(tzinfo=UTC))
+    if isinstance(start, datetime):
+        moment = start if start.tzinfo else start.replace(tzinfo=tz)
+    elif isinstance(start, date):
+        moment = datetime.combine(start, time(0, 0), tzinfo=tz)
+    else:
+        return (1, datetime.min.replace(tzinfo=UTC))
+    return (0, moment.astimezone(UTC))
 
 
 def _safe_name(uid: str) -> str:

@@ -14,6 +14,9 @@ import tempfile
 from pathlib import Path
 
 os.environ["MAIL_MULTITENANT"] = "1"
+# The fake servers listen on 127.0.0.1, which multi-user mode refuses by
+# default; the tests of that refusal turn this off for themselves.
+os.environ["MAIL_ALLOW_PRIVATE_TARGETS"] = "1"
 os.environ.setdefault("MAIL_LOG_LEVEL", "WARNING")
 _TEST_DATA = Path(tempfile.mkdtemp(prefix="mail-mcp-tests-"))
 os.environ["MAIL_STORE"] = str(_TEST_DATA / "store.json")

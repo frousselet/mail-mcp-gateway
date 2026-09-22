@@ -5,10 +5,17 @@ those and the plain values the MCP tools exchange. Parsing and serialisation go
 through the ``icalendar`` library rather than hand-rolled text handling, so
 line folding, escaping, parameters and timezones behave.
 
-Updates re-use the component that came off the server and change only the
+Updates re-use the resource that came off the server and change only the
 properties asked for: an event carries fields no agent knows about (alarms,
 custom X- properties, scheduling state), and rewriting it from scratch would
-silently drop them.
+silently drop them. That goes for the whole resource, not just one event: a
+recurring event is stored as its master plus one VEVENT per modified
+occurrence, and next to them the VTIMEZONE definitions their times refer to.
+All of that is written back.
+
+Recurring events are expanded into their occurrences for reading, so a daily
+meeting shows up on every day of the window it repeats in, with the moved and
+cancelled occurrences applied.
 """
 
 from __future__ import annotations
@@ -20,6 +27,7 @@ from datetime import UTC, date, datetime, time, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
+import recurring_ical_events
 from icalendar import Calendar, Event, vCalAddress, vText
 
 PRODID = "-//mail-mcp-gateway//CalDAV//EN"
@@ -265,38 +273,110 @@ def parse_events(
     except Exception as e:
         raise EventError(f"This calendar entry could not be read: {e}") from e
 
-    records: list[EventRecord] = []
-    for component in parsed.walk("VEVENT"):
-        start = component.decoded("dtstart", None) if component.get("dtstart") else None
-        if component.get("dtend"):
-            end = component.decoded("dtend", None)
-        elif component.get("duration") and start is not None:
-            end = start + component.decoded("duration")
-        else:
-            end = None
-        organizer = _text(component, "organizer").replace("mailto:", "")
-        records.append(
-            EventRecord(
-                uid=_text(component, "uid"),
-                summary=_text(component, "summary"),
-                start=start,
-                end=end,
-                all_day=isinstance(start, date) and not isinstance(start, datetime),
-                location=_text(component, "location"),
-                description=_text(component, "description"),
-                status=_text(component, "status"),
-                organizer=organizer,
-                attendees=_attendees(component),
-                recurrence=_rrule_text(component),
-                recurrence_id=_text(component, "recurrence-id"),
-                url=_text(component, "url"),
-                href=href,
-                etag=etag,
-                calendar=calendar,
-                raw=raw if isinstance(raw, bytes) else str(raw).encode(),
-            )
+    data = raw if isinstance(raw, bytes) else str(raw).encode()
+    return [
+        _record(component, href=href, etag=etag, calendar=calendar, raw=data)
+        for component in parsed.walk("VEVENT")
+    ]
+
+
+def _record(
+    component, *, href: str, etag: str, calendar: str, raw: bytes, rrule: str = ""
+) -> EventRecord:
+    start = component.decoded("dtstart", None) if component.get("dtstart") else None
+    if component.get("dtend"):
+        end = component.decoded("dtend", None)
+    elif component.get("duration") and start is not None:
+        end = start + component.decoded("duration")
+    elif start is not None and not isinstance(start, datetime):
+        # RFC 5545 3.6.1: an all-day event with neither DTEND nor DURATION
+        # lasts one day; a timed one lasts no time at all.
+        end = start + timedelta(days=1)
+    else:
+        end = None
+    recurrence_id = component.get("recurrence-id")
+    return EventRecord(
+        uid=_text(component, "uid"),
+        summary=_text(component, "summary"),
+        start=start,
+        end=end,
+        all_day=isinstance(start, date) and not isinstance(start, datetime),
+        location=_text(component, "location"),
+        description=_text(component, "description"),
+        status=_text(component, "status"),
+        organizer=_text(component, "organizer").replace("mailto:", "").replace(
+            "MAILTO:", ""
+        ),
+        attendees=_attendees(component),
+        recurrence=_rrule_text(component) or rrule,
+        recurrence_id=(
+            _isoformat(component.decoded("recurrence-id"))
+            if recurrence_id is not None
+            else ""
+        ),
+        url=_text(component, "url"),
+        href=href,
+        etag=etag,
+        calendar=calendar,
+        raw=raw,
+    )
+
+
+def expand_events(
+    raw: bytes | str,
+    start: datetime,
+    end: datetime,
+    *,
+    href: str = "",
+    etag: str = "",
+    calendar: str = "",
+) -> list[EventRecord]:
+    """The occurrences of a resource that fall in ``[start, end)``.
+
+    A CalDAV time-range query matches a recurring event when any occurrence
+    overlaps, but hands back the unexpanded resource: the master with its
+    first date and its rule. Expanding it here (rather than asking the server
+    to, which not every server supports) gives every occurrence in the window
+    its own dates, applies the modified ones (RECURRENCE-ID), and leaves out
+    the removed ones (EXDATE).
+    """
+    if not raw:
+        return []
+    try:
+        parsed = Calendar.from_ical(raw)
+    except Exception as e:
+        raise EventError(f"This calendar entry could not be read: {e}") from e
+    data = raw if isinstance(raw, bytes) else str(raw).encode()
+    rules = {
+        _text(component, "uid"): _rrule_text(component)
+        for component in parsed.walk("VEVENT")
+        if component.get("rrule")
+    }
+    try:
+        occurrences = recurring_ical_events.of(parsed).between(start, end)
+    except Exception:
+        # A rule the library cannot follow: show the resource as it is rather
+        # than lose the event.
+        return parse_events(raw, href=href, etag=etag, calendar=calendar)
+    return [
+        _record(
+            component,
+            href=href,
+            etag=etag,
+            calendar=calendar,
+            raw=data,
+            rrule=rules.get(_text(component, "uid"), ""),
         )
-    return records
+        for component in occurrences
+    ]
+
+
+def master_of(records: list[EventRecord]) -> EventRecord | None:
+    """The master event of a resource: the one that is not an override."""
+    for record in records:
+        if not record.recurrence_id:
+            return record
+    return records[0] if records else None
 
 
 # ---------------------------------------------------------------------------
@@ -304,12 +384,45 @@ def parse_events(
 # ---------------------------------------------------------------------------
 
 
+def _serialise(calendar: Calendar) -> bytes:
+    """Write a calendar, with a VTIMEZONE for every TZID its times use.
+
+    RFC 5545 requires one, and a client that cannot resolve a TZID shows the
+    event at the wrong time. Existing definitions are kept as they are (an
+    Outlook zone such as "Romance Standard Time" only exists in them).
+    """
+    try:
+        calendar.add_missing_timezones()
+    except Exception:  # an unknown zone name: leave it as it came
+        pass
+    return calendar.to_ical()
+
+
 def _wrap(component: Event) -> bytes:
     calendar = Calendar()
     calendar.add("prodid", PRODID)
     calendar.add("version", "2.0")
     calendar.add_component(component)
-    return calendar.to_ical()
+    return _serialise(calendar)
+
+
+def _read_calendar(raw: bytes) -> tuple[Calendar, list[Event]]:
+    try:
+        calendar = Calendar.from_ical(raw)
+    except Exception as e:
+        raise EventError(f"This calendar entry could not be read: {e}") from e
+    components = list(calendar.walk("VEVENT"))
+    if not components:
+        raise EventError("That calendar entry holds no event.")
+    return calendar, components
+
+
+def _is_day(value: Any) -> bool:
+    return isinstance(value, date) and not isinstance(value, datetime)
+
+
+def _day(value: datetime | date) -> date:
+    return value.date() if isinstance(value, datetime) else value
 
 
 def _set_attendees(component: Event, attendees: list[str] | str | None) -> None:
@@ -361,8 +474,11 @@ def build_event(
     component.add("dtstamp", datetime.now(UTC))
     component.add("summary", summary.strip())
     if all_day:
-        component.add("dtstart", start.date() if isinstance(start, datetime) else start)
-        component.add("dtend", end.date() if isinstance(end, datetime) else end)
+        # DTEND of an all-day event is the day after the last one (RFC 5545
+        # 3.6.1): "the 24th to the 26th" is DTEND 27th, a single day is +1.
+        first, last = _day(start), _day(end)
+        component.add("dtstart", first)
+        component.add("dtend", max(last, first) + timedelta(days=1))
     else:
         component.add("dtstart", start)
         component.add("dtend", end)
@@ -414,16 +530,18 @@ def edit_event(
     status: str | None = None,
     recurrence: str | None = None,
 ) -> bytes:
-    """Apply changes to an existing resource, keeping everything else intact."""
-    try:
-        calendar = Calendar.from_ical(raw)
-    except Exception as e:
-        raise EventError(f"This calendar entry could not be read: {e}") from e
+    """Apply changes to an existing resource, keeping everything else intact.
 
-    components = list(calendar.walk("VEVENT"))
-    if not components:
-        raise EventError("That calendar entry holds no event.")
-    component = components[0]
+    The change goes to the master event; the modified occurrences stored next
+    to it, and the timezone definitions, are written back untouched.
+
+    For an all-day event ``end`` is the last day, inclusive, as a person says
+    it; it is stored as the day after, as iCalendar wants.
+    """
+    calendar, components = _read_calendar(raw)
+    component = next(
+        (c for c in components if c.get("recurrence-id") is None), components[0]
+    )
 
     def replace(name: str, value: Any) -> None:
         component.pop(name, None)
@@ -442,23 +560,9 @@ def edit_event(
         if recurrence:
             component.add("rrule", _parse_rrule(recurrence))
     if start is not None or end is not None or all_day is not None:
-        current_start = component.decoded("dtstart") if component.get("dtstart") else None
-        current_end = component.decoded("dtend") if component.get("dtend") else None
-        new_start = start if start is not None else current_start
-        new_end = end if end is not None else current_end
-        if new_start is None or new_end is None:
-            raise EventError("Changing the time needs both a start and an end.")
-        if new_end < new_start:
-            raise EventError("The event would end before it starts.")
-        whole_day = (
-            all_day
-            if all_day is not None
-            else isinstance(new_start, date) and not isinstance(new_start, datetime)
-        )
-        if whole_day:
-            new_start = new_start.date() if isinstance(new_start, datetime) else new_start
-            new_end = new_end.date() if isinstance(new_end, datetime) else new_end
+        new_start, new_end = _new_times(component, start, end, all_day)
         replace("dtstart", new_start)
+        component.pop("duration", None)
         replace("dtend", new_end)
     if attendees is not None:
         _set_attendees(component, attendees)
@@ -466,7 +570,69 @@ def edit_event(
     replace("dtstamp", datetime.now(UTC))
     sequence = int(component.get("sequence", 0) or 0)
     replace("sequence", sequence + 1)
-    return _wrap(component)
+    return _serialise(calendar)
+
+
+def _new_times(
+    component,
+    start: datetime | date | None,
+    end: datetime | date | None,
+    all_day: bool | None,
+) -> tuple[datetime | date, datetime | date]:
+    """Work out DTSTART and DTEND after a change of time.
+
+    The kind of event (all day or timed) stays what it was unless ``all_day``
+    says otherwise, and moving only the start keeps the duration.
+    """
+    current_start = component.decoded("dtstart") if component.get("dtstart") else None
+    if component.get("dtend"):
+        current_end = component.decoded("dtend")
+    elif component.get("duration") and current_start is not None:
+        current_end = current_start + component.decoded("duration")
+    elif current_start is not None and _is_day(current_start):
+        current_end = current_start + timedelta(days=1)
+    else:
+        current_end = current_start
+
+    was_day = _is_day(current_start)
+    whole_day = all_day if all_day is not None else was_day
+
+    if whole_day:
+        first = _day(start) if start is not None else (
+            _day(current_start) if current_start is not None else None
+        )
+        if first is None:
+            raise EventError("Changing the time needs a start.")
+        if end is not None:
+            after_last = _day(end) + timedelta(days=1)
+        elif was_day and current_start is not None and current_end is not None:
+            after_last = first + (_day(current_end) - _day(current_start))
+        else:
+            after_last = first + timedelta(days=1)
+        if after_last <= first:
+            raise EventError("The event would end before it starts.")
+        return first, after_last
+
+    if start is None and was_day:
+        raise EventError(
+            "To turn an all-day event into a timed one, give its new start time."
+        )
+    new_start = start if start is not None else current_start
+    if new_start is None:
+        raise EventError("Changing the time needs a start.")
+    if _is_day(new_start):
+        raise EventError("A timed event needs a start time, not just a date.")
+    if end is not None:
+        new_end = end
+    elif not was_day and current_start is not None and current_end is not None:
+        new_end = new_start + (current_end - current_start)
+    else:
+        new_end = new_start + timedelta(hours=1)
+    if _is_day(new_end):
+        raise EventError("A timed event needs an end time, not just a date.")
+    if new_end < new_start:
+        raise EventError("The event would end before it starts.")
+    return new_start, new_end
 
 
 def set_participation(raw: bytes, address: str, answer: str) -> bytes:
@@ -476,33 +642,32 @@ def set_participation(raw: bytes, address: str, answer: str) -> bytes:
         raise EventError(
             f"{answer!r} is not an answer I understand. Use accept, decline or tentative."
         )
-    try:
-        calendar = Calendar.from_ical(raw)
-    except Exception as e:
-        raise EventError(f"This calendar entry could not be read: {e}") from e
+    calendar, components = _read_calendar(raw)
 
-    components = list(calendar.walk("VEVENT"))
-    if not components:
-        raise EventError("That calendar entry holds no event.")
-    component = components[0]
-
+    # The answer is for the whole series: the master and every modified
+    # occurrence carry their own attendee list.
     wanted = address.strip().lower()
-    entries = component.get("attendee")
-    entries = entries if isinstance(entries, list) else ([entries] if entries else [])
     matched = False
-    for entry in entries:
-        email = str(entry).replace("mailto:", "").replace("MAILTO:", "").strip().lower()
-        if email == wanted:
-            entry.params["PARTSTAT"] = vText(partstat)
-            entry.params.pop("RSVP", None)
-            matched = True
+    for component in components:
+        entries = component.get("attendee")
+        entries = entries if isinstance(entries, list) else ([entries] if entries else [])
+        touched = False
+        for entry in entries:
+            email = str(entry).replace("mailto:", "").replace("MAILTO:", "").strip().lower()
+            if email == wanted:
+                entry.params["PARTSTAT"] = vText(partstat)
+                entry.params.pop("RSVP", None)
+                touched = True
+        if not touched:
+            continue
+        matched = True
+        component.pop("attendee", None)
+        for entry in entries:
+            component.add("attendee", entry, encode=0)
+        component.pop("dtstamp", None)
+        component.add("dtstamp", datetime.now(UTC))
     if not matched:
         raise EventError(
             f"{address} is not an attendee of this event, so there is nothing to answer."
         )
-    component.pop("attendee", None)
-    for entry in entries:
-        component.add("attendee", entry, encode=0)
-    component.pop("dtstamp", None)
-    component.add("dtstamp", datetime.now(UTC))
-    return _wrap(component)
+    return _serialise(calendar)

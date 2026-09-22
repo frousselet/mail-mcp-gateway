@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
-from mail_mcp import mutf7
+from mail_mcp import mutf7, netguard
 from mail_mcp.accounts import AUTH_XOAUTH2, SECURITY_NONE, SECURITY_SSL, MailAccount
 from mail_mcp.xoauth2 import TokenError, access_token_for, sasl_xoauth2_raw
 
@@ -189,6 +189,10 @@ class ImapClient:
     def _connect_sync(self) -> imaplib.IMAP4:
         account = self.account
         context = ssl_context(account.verify_ssl)
+        try:
+            netguard.check_host(account.imap_host)
+        except netguard.TargetError as e:
+            raise ImapError(str(e)) from e
         try:
             if account.imap_security == SECURITY_SSL:
                 conn: imaplib.IMAP4 = imaplib.IMAP4_SSL(

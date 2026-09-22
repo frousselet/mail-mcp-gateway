@@ -13,6 +13,7 @@ import smtplib
 import ssl
 from typing import Any
 
+from mail_mcp import netguard
 from mail_mcp.accounts import AUTH_XOAUTH2, SECURITY_NONE, SECURITY_SSL, MailAccount
 from mail_mcp.imap_client import ssl_context
 from mail_mcp.xoauth2 import TokenError, access_token_for, sasl_xoauth2_b64
@@ -30,6 +31,10 @@ class SmtpError(RuntimeError):
 
 
 def _connect(account: MailAccount, context: ssl.SSLContext) -> smtplib.SMTP:
+    try:
+        netguard.check_host(account.smtp_host)
+    except netguard.TargetError as e:
+        raise SmtpError(str(e)) from e
     if account.smtp_security == SECURITY_SSL:
         return smtplib.SMTP_SSL(
             account.smtp_host,

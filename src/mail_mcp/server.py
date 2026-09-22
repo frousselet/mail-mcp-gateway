@@ -1794,9 +1794,11 @@ async def create_event(
     Args:
         summary: The event title.
         start: When it starts (2026-09-24T10:00, 'tomorrow', '+2d').
-        end: When it ends; omit to use duration_minutes instead.
+        end: When it ends; omit to use duration_minutes instead. For an
+            all-day event, the last day it covers (inclusive).
         duration_minutes: Length when no end is given (default 60).
-        all_day: Book whole days rather than a time range.
+        all_day: Book whole days rather than a time range; without an end,
+            one day.
         location: Where it happens.
         description: Longer notes for the event body.
         attendees: Comma-separated invitees ("Bob <bob@x.test>, carol@x.test").
@@ -1811,7 +1813,9 @@ async def create_event(
         tz = calendar_account.timezone
         starts = parse_when(start, tz)
         if end:
-            ends = parse_when(end, tz, end_of_day=all_day)
+            ends = parse_when(end, tz)
+        elif all_day:
+            ends = starts
         else:
             ends = starts + timedelta(minutes=max(1, duration_minutes))
         uid, ics = build_event(
@@ -1826,9 +1830,14 @@ async def create_event(
             recurrence=recurrence,
         )
         _, target = await client.create(ics, uid, calendar=calendar)
+        if all_day:
+            first, last = starts.date(), max(ends.date(), starts.date())
+            when = f"{first} (all day)" if first == last else f"{first} to {last} (all day)"
+        else:
+            when = f"{starts.isoformat()} to {ends.isoformat()}"
         return formatting.format_action(
             f"Created **{summary}** in {target.name} ({calendar_account.address}).",
-            when=f"{starts.isoformat()} to {ends.isoformat()}",
+            when=when,
             location=location,
             attendees=attendees,
             repeats=recurrence,
@@ -1849,6 +1858,7 @@ async def update_event(
     attendees: str | None = None,
     recurrence: str | None = None,
     status: str | None = None,
+    all_day: bool | None = None,
     calendar: str | None = None,
     account: str | None = None,
 ) -> str:
@@ -1860,13 +1870,15 @@ async def update_event(
     Args:
         uid: The UID of the event to change.
         summary: New title.
-        start: New start; pass both start and end to move the event.
-        end: New end.
+        start: New start. Moving only the start keeps the duration.
+        end: New end. For an all-day event, the last day it covers (inclusive).
         location: New location.
         description: New notes.
         attendees: Replacement attendee list, comma-separated.
         recurrence: New recurrence rule, or "" to make it a one-off.
         status: CONFIRMED, TENTATIVE or CANCELLED.
+        all_day: True to make it an all-day event, false to make it a timed one
+            (then give a start time). Omit to keep what it is.
         calendar: Which calendar it lives in; omit to search the account's calendars.
         account: Which calendar account to use (address, label or id).
     """
@@ -1889,6 +1901,7 @@ async def update_event(
                 attendees=attendees,
                 recurrence=recurrence,
                 status=status,
+                all_day=all_day,
             )
 
         # Re-read the resource and write against its own validator: the ETag
@@ -1907,6 +1920,7 @@ async def update_event(
                 ("attendees", attendees),
                 ("recurrence", recurrence),
                 ("status", status),
+                ("all day", all_day),
             )
             if value is not None
         ]
@@ -2062,14 +2076,20 @@ def _free_slots(
     for event in events:
         if (event.status or "").upper() == "CANCELLED" or event.start is None:
             continue
-        start, end = event.start, event.end or event.start
+        start, end = event.start, event.end
         if not isinstance(start, _datetime):  # all-day: busy for the whole day
+            # DTEND is exclusive, and an all-day event without one lasts a
+            # day (RFC 5545 3.6.1), never zero.
+            if end is None or end <= start:
+                end = start + timedelta(days=1)
             start = _datetime.combine(start, dtime(0, 0), tzinfo=info)
             end = _datetime.combine(
                 end if not isinstance(end, _datetime) else end.date(),
                 dtime(0, 0),
                 tzinfo=info,
             )
+        elif end is None:
+            end = start
         busy.append((start.astimezone(info), end.astimezone(info)))
     busy.sort()
 
