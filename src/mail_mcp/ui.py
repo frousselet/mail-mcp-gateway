@@ -224,6 +224,13 @@ def dashboard_page(
                 rows = "".join(
                     f"<tr><td>{esc(box['address'])}"
                     + (" <small>(default)</small>" if box["is_default"] else "")
+                    + (
+                        f"<br><small class='muted'>Sends as "
+                        f"{esc(', '.join(box.get('sends_as', [])))}</small>"
+                        if len(box.get("sends_as", [])) > 1
+                        or (box.get("sends_as") or [box["address"]])[0] != box["address"]
+                        else ""
+                    )
                     + f"<br><small class='muted'>{esc(box['imap'])} | "
                     f"{esc(box['smtp'])} | {esc(box['auth'])}"
                     + (" | read-only" if box["read_only"] else "")
@@ -355,6 +362,16 @@ def mailbox_form_page(connection: dict[str, Any], error: str = "") -> str:
 
   <label>Display name <small>(optional, used in the From header)</small>
     <input id="from_name" name="from_name" autocomplete="off" placeholder="Ada Lovelace"></label>
+
+  <label>Send from <small>(optional, when mail should go out as another address)</small>
+    <input id="from_address" name="from_address" type="email" autocomplete="off"
+           placeholder="you@your-domain.com"></label>
+  <label>Other sending addresses <small>(optional, comma-separated)</small>
+    <input id="aliases" name="aliases" autocomplete="off"
+           placeholder="contact@your-domain.com, billing@your-domain.com"></label>
+  <p class="muted">Leave both empty to send as the address above. An iCloud+ custom
+    domain is the usual reason to fill them in: you sign in with your Apple ID but
+    write as your own address. The agent may only send as one of these.</p>
 
   <div class="grid">
     <label>IMAP server<input id="imap_host" name="imap_host" required

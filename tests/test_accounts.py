@@ -83,3 +83,54 @@ def test_default_falls_back_to_the_first_account():
     first = _account(account_id="box_1")
     second = _account(address="b@example.test", account_id="box_2")
     assert AccountSet([first, second]).resolve() is first
+
+
+# ---------------------------------------------------------------------------
+# Sending identities: iCloud+ custom domains, aliases
+# ---------------------------------------------------------------------------
+
+
+def test_from_address_overrides_the_login_address():
+    account = _account(address="ada@icloud.com", from_address="francois@rslt.fr")
+    assert account.default_sender() == "francois@rslt.fr"
+    assert account.sender() == "francois@rslt.fr"
+    assert account.imap_username == "ada@icloud.com"  # login is untouched
+
+
+def test_identities_list_the_default_first_without_duplicates():
+    account = _account(
+        address="ada@icloud.com",
+        from_address="francois@rslt.fr",
+        aliases=["contact@rslt.fr", "ada@icloud.com", "  "],
+    )
+    assert account.sending_identities() == [
+        "francois@rslt.fr",
+        "ada@icloud.com",
+        "contact@rslt.fr",
+    ]
+
+
+def test_aliases_accept_a_comma_separated_string():
+    account = _account(aliases="one@example.test; two@example.test\nthree@example.test")
+    assert account.sending_identities()[1:] == [
+        "one@example.test",
+        "two@example.test",
+        "three@example.test",
+    ]
+
+
+def test_resolving_a_sender_accepts_a_display_form_and_any_case():
+    account = _account(aliases=["Contact@RSLT.fr"])
+    assert account.resolve_sender("contact@rslt.fr") == "Contact@RSLT.fr"
+    assert account.resolve_sender("Someone <CONTACT@rslt.fr>") == "Contact@RSLT.fr"
+
+
+def test_sending_as_an_unknown_address_is_refused():
+    account = _account(address="ada@example.test")
+    with pytest.raises(AccountConfigError, match="is not an address"):
+        account.resolve_sender("boss@othercompany.test")
+
+
+def test_display_name_applies_to_whichever_identity_is_used():
+    account = _account(from_name="Ada", aliases=["contact@example.test"])
+    assert account.sender("contact@example.test") == "Ada <contact@example.test>"

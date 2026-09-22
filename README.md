@@ -54,6 +54,19 @@ Outgoing mail is copied to the Sent folder, replies keep `In-Reply-To` and
 `References` so threads hold together, and a mailbox can be attached
 **read-only** so an agent can read it but never send, move or delete.
 
+### Sending as another address
+
+The address you sign in with is not always the address you write from. An
+iCloud+ custom domain is the common case: you authenticate with your Apple ID
+and send as `you@your-domain`. A mailbox therefore carries a **Send from**
+address and a list of **other sending addresses**; `list_accounts` reports them,
+and every sending tool takes `from_address` to pick one.
+
+An address that is not on that list is refused before anything leaves the
+machine, so an agent acting on a message it just read cannot send as someone
+else. Replies default to whichever of your addresses the original was sent to,
+so mail to `contact@` is answered by `contact@`.
+
 IMAP cannot edit a message in place, so `update_draft` writes the revised draft
 and removes the old one, carrying over every field and attachment you did not
 change, and returns the new UID. A draft keeps its Bcc recipients in the
@@ -264,7 +277,7 @@ every variable.
 
 ```bash
 uv venv && uv pip install -e ".[dev]"
-uv run pytest        # 212 tests, including fake IMAP and CalDAV servers
+uv run pytest        # 228 tests, including fake IMAP and CalDAV servers
 uv run ruff check src tests
 ```
 

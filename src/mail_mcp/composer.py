@@ -26,6 +26,7 @@ class ComposeError(ValueError):
 class OutgoingMessage:
     message: EmailMessage
     recipients: list[str] = field(default_factory=list)
+    envelope_from: str = ""
 
     @property
     def message_id(self) -> str:
@@ -101,6 +102,7 @@ def build_message(
     attachments: list[dict[str, Any]] | None = None,
     headers: dict[str, str] | None = None,
     bcc_header: bool = False,
+    from_address: str | None = None,
 ) -> OutgoingMessage:
     """Build a message ready to hand to SMTP or to APPEND as a draft.
 
@@ -115,8 +117,9 @@ def build_message(
     if not (to_list or cc_list or bcc_list):
         raise ComposeError("At least one recipient is required (to, cc or bcc).")
 
+    sender = account.resolve_sender(from_address)
     message = EmailMessage()
-    message["From"] = account.sender()
+    message["From"] = account.sender(sender)
     if to_list:
         message["To"] = ", ".join(to_list)
     if cc_list:
@@ -125,7 +128,7 @@ def build_message(
         message["Bcc"] = ", ".join(bcc_list)
     message["Subject"] = subject or "(no subject)"
     message["Date"] = format_datetime(datetime.now(UTC))
-    domain = account.address.rpartition("@")[2] or "localhost"
+    domain = sender.rpartition("@")[2] or "localhost"
     message["Message-ID"] = make_msgid(domain=domain)
     reply_list = _split_addresses(reply_to)
     if reply_list:
@@ -143,7 +146,9 @@ def build_message(
     attach_files(message, attachments)
 
     recipients = [_bare(a) for a in to_list + cc_list + bcc_list]
-    return OutgoingMessage(message=message, recipients=recipients)
+    return OutgoingMessage(
+        message=message, recipients=recipients, envelope_from=sender
+    )
 
 
 def _quote_body(original: ParsedMessage, limit: int = 8000) -> str:
@@ -165,15 +170,22 @@ def build_reply(
     attachments: list[dict[str, Any]] | None = None,
     quote_original: bool = True,
     extra_to: str | list[str] | None = None,
+    from_address: str | None = None,
 ) -> OutgoingMessage:
-    """Build a reply threaded onto ``original``."""
+    """Build a reply threaded onto ``original``.
+
+    With no explicit ``from_address``, the reply goes out as whichever of this
+    mailbox's addresses the original was sent to: on a custom domain, an email
+    to contact@ is answered by contact@, not by the Apple ID behind it.
+    """
+    sender = from_address or _identity_addressed(account, original)
     reply_targets = original.reply_to or ([original.from_] if original.from_ else [])
     to_list = _split_addresses(reply_targets) + _split_addresses(extra_to)
     cc_list: list[str] = []
     if reply_all:
-        mine = account.address.lower()
+        mine = {i.lower() for i in account.sending_identities()}
         for address in original.to + original.cc:
-            if _bare(address).lower() != mine and address not in to_list:
+            if _bare(address).lower() not in mine and address not in to_list:
                 cc_list.append(address)
     if not to_list and not cc_list:
         raise ComposeError("The original message has no address to reply to.")
@@ -205,7 +217,18 @@ def build_reply(
         html=html,
         attachments=attachments,
         headers=headers,
+        from_address=sender,
     )
+
+
+def _identity_addressed(account: MailAccount, original: ParsedMessage) -> str | None:
+    """Which of this mailbox's addresses the message was sent to, if any."""
+    identities = {i.lower(): i for i in account.sending_identities()}
+    for address in original.to + original.cc:
+        match = identities.get(_bare(address).lower())
+        if match:
+            return match
+    return None
 
 
 def build_forward(
@@ -216,6 +239,7 @@ def build_forward(
     body: str = "",
     cc: str | list[str] | None = None,
     attach_original: bool = True,
+    from_address: str | None = None,
 ) -> OutgoingMessage:
     """Build a forward, carrying the original message as an attachment."""
     subject = original.subject or ""
@@ -238,7 +262,12 @@ def build_forward(
     text = f"{intro}\n\n{header_block}\n\n{original.body}".strip()
 
     outgoing = build_message(
-        account, to=to, cc=cc, subject=subject, body=text
+        account,
+        to=to,
+        cc=cc,
+        subject=subject,
+        body=text,
+        from_address=from_address or _identity_addressed(account, original),
     )
     if attach_original and original.raw:
         outgoing.message.add_attachment(
@@ -291,6 +320,7 @@ def revise_draft(
     html: str | None = None,
     attachments: list[dict[str, Any]] | None = None,
     keep_attachments: bool = True,
+    from_address: str | None = None,
 ) -> OutgoingMessage:
     """Build the revised version of a draft: only the given fields change.
 
@@ -315,10 +345,20 @@ def revise_draft(
             "References": " ".join(original.references),
         },
         bcc_header=True,
+        from_address=from_address or _sender_of(account, original),
     )
 
 
-def prepare_for_sending(original: ParsedMessage) -> tuple[bytes, list[str]]:
+def _sender_of(account: MailAccount, original: ParsedMessage) -> str | None:
+    """The address a stored message was written as, if it is still allowed."""
+    if not original.from_:
+        return None
+    bare = _bare(original.from_)
+    identities = {i.lower(): i for i in account.sending_identities()}
+    return identities.get(bare.lower())
+
+
+def prepare_for_sending(original: ParsedMessage) -> tuple[bytes, list[str], str]:
     """Turn a stored draft into what SMTP needs: the wire bytes and envelope.
 
     ``Bcc`` is read to build the envelope and then stripped from the message,
@@ -338,4 +378,5 @@ def prepare_for_sending(original: ParsedMessage) -> tuple[bytes, list[str]]:
     del message["Bcc"]
     del message["Date"]
     message["Date"] = format_datetime(datetime.now(UTC))
-    return message.as_bytes(), recipients
+    envelope_from = _bare(str(message.get("From", ""))) or ""
+    return message.as_bytes(), recipients, envelope_from

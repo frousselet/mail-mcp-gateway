@@ -42,6 +42,13 @@ class MailAccount:
     account_id: str = ""
     label: str = ""
     from_name: str = ""
+    # The address mail goes out as, when it differs from the login address.
+    # iCloud+ custom domains are the usual case: you authenticate as your Apple
+    # ID but write as you@yourdomain.
+    from_address: str = ""
+    # Other addresses this mailbox is allowed to send as (aliases, domain
+    # addresses). A tool may pick any of these; anything else is refused.
+    aliases: list[str] = field(default_factory=list)
 
     imap_host: str = ""
     imap_port: int = 993
@@ -81,6 +88,13 @@ class MailAccount:
         self.imap_username = (self.imap_username or self.address).strip()
         self.smtp_username = (self.smtp_username or self.address).strip()
         self.label = self.label.strip() or self.address
+        self.from_address = self.from_address.strip()
+        if isinstance(self.aliases, str):
+            self.aliases = [
+                part.strip()
+                for part in self.aliases.replace(";", ",").replace("\n", ",").split(",")
+            ]
+        self.aliases = [alias.strip() for alias in self.aliases if alias and alias.strip()]
 
     # --- validation ---
 
@@ -124,11 +138,45 @@ class MailAccount:
             self.label.lower(),
         } - {""}
 
-    def sender(self) -> str:
+    def default_sender(self) -> str:
+        """The bare address mail goes out as unless a tool asks for another."""
+        return self.from_address or self.address
+
+    def sending_identities(self) -> list[str]:
+        """Every address this mailbox may send as, default first."""
+        out: list[str] = []
+        for candidate in [self.default_sender(), self.address, *self.aliases]:
+            cleaned = candidate.strip()
+            if cleaned and cleaned.lower() not in {o.lower() for o in out}:
+                out.append(cleaned)
+        return out
+
+    def resolve_sender(self, selector: str | None = None) -> str:
+        """Check a requested From address against what this mailbox may use.
+
+        Refusing an unknown address is the point: an agent acting on a message
+        it just read must not be able to send as someone else.
+        """
+        identities = self.sending_identities()
+        if not selector:
+            return identities[0]
+        wanted = selector.strip()
+        bare = wanted.rpartition("<")[2].rstrip(">").strip() or wanted
+        for identity in identities:
+            if identity.lower() == bare.lower():
+                return identity
+        raise AccountConfigError(
+            f"{selector!r} is not an address {self.address} may send as. "
+            f"Allowed: {', '.join(identities)}. Add it to the mailbox's sending "
+            "addresses in the web UI if it should be."
+        )
+
+    def sender(self, from_address: str | None = None) -> str:
         """The ``From`` header value, with a display name when one is set."""
+        address = self.resolve_sender(from_address)
         if self.from_name:
-            return f"{self.from_name} <{self.address}>"
-        return self.address
+            return f"{self.from_name} <{address}>"
+        return address
 
     # --- serialisation (secrets handled by the store) ---
 
@@ -157,6 +205,7 @@ class MailAccount:
             "imap": f"{self.imap_host}:{self.imap_port} ({self.imap_security})",
             "smtp": f"{self.smtp_host}:{self.smtp_port} ({self.smtp_security})",
             "auth": self.auth,
+            "sends_as": self.sending_identities(),
             "read_only": self.read_only,
             "settings_source": self.settings_source,
         }

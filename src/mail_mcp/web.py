@@ -122,6 +122,7 @@ def _connection_view(connection, base_url: str) -> dict[str, Any]:
                 "smtp": f"{account.smtp_host}:{account.smtp_port} "
                 f"({account.smtp_security})",
                 "auth": account.auth,
+                "sends_as": account.sending_identities(),
                 "read_only": account.read_only,
                 "is_default": account.account_id == connection.default_account_id,
             }
@@ -408,6 +409,8 @@ def _account_from_form(form: Any) -> MailAccount:
     return MailAccount(
         address=field("address"),
         from_name=field("from_name"),
+        from_address=field("from_address"),
+        aliases=field("aliases"),
         imap_host=field("imap_host"),
         imap_port=port("imap_port", 993),
         imap_security=field("imap_security", "ssl").lower(),

@@ -56,6 +56,9 @@ def format_accounts(accounts: list[MailAccount], default_account_id: str = "") -
                      f"({account.imap_security})")
         lines.append(f"  SMTP: {account.smtp_host}:{account.smtp_port} "
                      f"({account.smtp_security})")
+        identities = account.sending_identities()
+        if identities[0].lower() != account.address.lower() or len(identities) > 1:
+            lines.append(f"  Sends as: {', '.join(identities)} (first is the default)")
         lines.append(f"  Auth: {account.auth}"
                      + (" | read-only" if account.read_only else ""))
         lines.append("")

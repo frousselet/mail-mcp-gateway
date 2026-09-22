@@ -865,6 +865,7 @@ async def send_message(
     html: str | None = None,
     attachments: list[dict[str, Any]] | None = None,
     save_to_sent: bool = True,
+    from_address: str | None = None,
     account: str | None = None,
 ) -> str:
     """Send a new email. This is irreversible: confirm with the user first.
@@ -878,6 +879,9 @@ async def send_message(
         html: Optional HTML alternative of the body.
         attachments: [{"filename": ..., "content_base64": ..., "content_type": ...}].
         save_to_sent: Also store a copy in the Sent folder (default true).
+        from_address: Which of this mailbox's addresses to send as (an alias or
+            custom-domain address). Omit for the mailbox's default. Run
+            list_accounts to see what it may send as.
         account: Which mailbox to send from (address, label or id).
     """
     try:
@@ -892,9 +896,13 @@ async def send_message(
             bcc=bcc,
             html=html or "",
             attachments=attachments,
+            from_address=from_address,
         )
         result = await smtp_client.send(
-            mail_account, outgoing.as_bytes(), outgoing.recipients
+            mail_account,
+            outgoing.as_bytes(),
+            outgoing.recipients,
+            sender=outgoing.envelope_from,
         )
         saved = ""
         if save_to_sent:
@@ -919,9 +927,13 @@ async def reply_message(
     quote_original: bool = True,
     attachments: list[dict[str, Any]] | None = None,
     save_to_sent: bool = True,
+    from_address: str | None = None,
     account: str | None = None,
 ) -> str:
     """Reply to a message, keeping it in the same conversation.
+
+    By default the reply goes out as whichever of this mailbox's addresses the
+    original was sent to, so a message to an alias is answered by that alias.
 
     Args:
         uid: The UID of the message to reply to.
@@ -931,6 +943,7 @@ async def reply_message(
         quote_original: Append the quoted original (default true).
         attachments: [{"filename": ..., "content_base64": ..., "content_type": ...}].
         save_to_sent: Also store a copy in the Sent folder (default true).
+        from_address: Override which of this mailbox's addresses to reply as.
         account: Which mailbox to reply from (address, label or id).
     """
     try:
@@ -944,9 +957,13 @@ async def reply_message(
             reply_all=reply_all,
             attachments=attachments,
             quote_original=quote_original,
+            from_address=from_address,
         )
         result = await smtp_client.send(
-            mail_account, outgoing.as_bytes(), outgoing.recipients
+            mail_account,
+            outgoing.as_bytes(),
+            outgoing.recipients,
+            sender=outgoing.envelope_from,
         )
         saved = ""
         if save_to_sent:
@@ -975,6 +992,7 @@ async def forward_message(
     cc: str | None = None,
     attach_original: bool = True,
     save_to_sent: bool = True,
+    from_address: str | None = None,
     account: str | None = None,
 ) -> str:
     """Forward a message to someone else.
@@ -987,6 +1005,7 @@ async def forward_message(
         cc: Carbon-copy recipient(s), comma-separated.
         attach_original: Attach the original as a .eml file (default true).
         save_to_sent: Also store a copy in the Sent folder (default true).
+        from_address: Which of this mailbox's addresses to forward as.
         account: Which mailbox to forward from (address, label or id).
     """
     try:
@@ -1000,9 +1019,13 @@ async def forward_message(
             body=body,
             cc=cc,
             attach_original=attach_original,
+            from_address=from_address,
         )
         result = await smtp_client.send(
-            mail_account, outgoing.as_bytes(), outgoing.recipients
+            mail_account,
+            outgoing.as_bytes(),
+            outgoing.recipients,
+            sender=outgoing.envelope_from,
         )
         saved = ""
         if save_to_sent:
@@ -1027,6 +1050,7 @@ async def save_draft(
     bcc: str | None = None,
     html: str | None = None,
     attachments: list[dict[str, Any]] | None = None,
+    from_address: str | None = None,
     account: str | None = None,
 ) -> str:
     """Write a message to the Drafts folder without sending it.
@@ -1041,6 +1065,7 @@ async def save_draft(
         bcc: Blind carbon-copy recipient(s), comma-separated.
         html: Optional HTML alternative of the body.
         attachments: [{"filename": ..., "content_base64": ..., "content_type": ...}].
+        from_address: Which of this mailbox's addresses the draft is written as.
         account: Which mailbox to draft in (address, label or id).
     """
     try:
@@ -1057,6 +1082,7 @@ async def save_draft(
             attachments=attachments,
             # A draft keeps its blind recipients; send_draft strips them.
             bcc_header=True,
+            from_address=from_address,
         )
         saved = await _save_copy(client, "drafts", outgoing.as_bytes(), "\\Draft")
         if not saved:
@@ -1098,6 +1124,7 @@ async def update_draft(
     bcc: str | None = None,
     html: str | None = None,
     attachments: list[dict[str, Any]] | None = None,
+    from_address: str | None = None,
     account: str | None = None,
 ) -> str:
     """Revise an existing draft. Only the fields you pass change.
@@ -1116,6 +1143,7 @@ async def update_draft(
         bcc: Replacement blind carbon-copy recipient(s); omit to keep them.
         html: Replacement HTML alternative; omit to keep it.
         attachments: Replacement attachments; omit to carry the current ones over.
+        from_address: Change which of this mailbox's addresses it is written as.
         account: Which mailbox to act on (address, label or id).
     """
     try:
@@ -1132,6 +1160,7 @@ async def update_draft(
             bcc=bcc,
             html=html,
             attachments=attachments,
+            from_address=from_address,
         )
         target = await client.folder_for_role("drafts")
         if not target:
@@ -1196,8 +1225,13 @@ async def send_draft(
         mail_account, client = _resolve(account)
         _ensure_writable(mail_account, "sending")
         original = parse_message(await client.fetch_raw(folder, uid))
-        payload, recipients = prepare_for_sending(original)
-        result = await smtp_client.send(mail_account, payload, recipients)
+        payload, recipients, envelope_from = prepare_for_sending(original)
+        result = await smtp_client.send(
+            mail_account,
+            payload,
+            recipients,
+            sender=mail_account.resolve_sender(envelope_from or None),
+        )
         saved = ""
         if save_to_sent:
             saved = await _save_copy(client, "sent", payload, "\\Seen")

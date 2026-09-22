@@ -321,3 +321,70 @@ async def test_read_only_mailbox_refuses_both_draft_tools(tools, account, sent_m
     assert "read-only" in await tools.update_draft(uid=uid, body="x")
     assert "read-only" in await tools.send_draft(uid=uid)
     assert sent_messages == []
+
+
+# ---------------------------------------------------------------------------
+# Sending as another address (iCloud+ custom domain, aliases)
+# ---------------------------------------------------------------------------
+
+
+async def test_list_accounts_shows_the_sending_addresses(tools, account):
+    account.from_address = "francois@rslt.fr"
+    account.aliases = ["contact@rslt.fr"]
+    out = await tools.list_accounts()
+    assert "Sends as: francois@rslt.fr" in out
+    assert "contact@rslt.fr" in out
+
+
+async def test_send_uses_the_mailbox_default_sender(tools, account, sent_messages):
+    account.from_address = "francois@rslt.fr"
+    await tools.send_message(to="bob@example.test", subject="x", body="y")
+    raw = sent_messages[0]["raw"].replace(b"\r\n ", b"")
+    assert b"From: francois@rslt.fr" in raw
+    assert sent_messages[0]["from"] == account.address  # login address unchanged
+
+
+async def test_send_as_a_chosen_alias(tools, account, sent_messages):
+    account.aliases = ["contact@rslt.fr"]
+    out = await tools.send_message(
+        to="bob@example.test", subject="x", body="y", from_address="contact@rslt.fr"
+    )
+    assert not out.startswith("Error:")
+    assert b"From: contact@rslt.fr" in sent_messages[0]["raw"].replace(b"\r\n ", b"")
+
+
+async def test_sending_as_a_stranger_is_refused(tools, sent_messages):
+    out = await tools.send_message(
+        to="bob@example.test", subject="x", body="y", from_address="ceo@victim.test"
+    )
+    assert out.startswith("Error:")
+    assert "is not an address" in out
+    assert sent_messages == []
+
+
+async def test_reply_answers_from_the_alias_that_was_written_to(
+    tools, account, imap_server, sent_messages
+):
+    from tests.fake_imap import _message
+
+    account.aliases = ["contact@rslt.fr"]
+    inbox = imap_server.state.folders["INBOX"]
+    uid = inbox.add(
+        _message(9, "Demande", "Client <client@example.test>", "contact@rslt.fr",
+                 "Tue, 22 Sep 2026 09:00:00 +0000", "Bonjour"),
+    )
+    await tools.reply_message(uid=uid, body="Bonjour")
+    assert b"From: contact@rslt.fr" in sent_messages[0]["raw"].replace(b"\r\n ", b"")
+
+
+async def test_draft_written_as_an_alias_is_sent_as_that_alias(
+    tools, account, imap_server, sent_messages
+):
+    account.aliases = ["contact@rslt.fr"]
+    await tools.save_draft(
+        to="bob@example.test", subject="Devis", body="...",
+        from_address="contact@rslt.fr",
+    )
+    uid = max(imap_server.state.folders["Drafts"].messages)
+    await tools.send_draft(uid=uid)
+    assert b"From: contact@rslt.fr" in sent_messages[0]["raw"].replace(b"\r\n ", b"")

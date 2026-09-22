@@ -183,10 +183,11 @@ def test_prepare_for_sending_moves_bcc_to_the_envelope(sender_account):
         sender_account, to="bob@example.test", cc="carol@example.test",
         bcc="audit@example.test", subject="x", body="y", bcc_header=True,
     )
-    payload, recipients = prepare_for_sending(parse_message(draft.as_bytes()))
+    payload, recipients, envelope_from = prepare_for_sending(parse_message(draft.as_bytes()))
     assert set(recipients) == {"bob@example.test", "carol@example.test", "audit@example.test"}
     assert b"audit@example.test" not in payload.replace(b"\r\n ", b"")
     assert b"Date:" in payload
+    assert envelope_from == "ada@example.test"
 
 
 def test_prepare_for_sending_refuses_a_draft_with_nobody_to_send_to(sender_account):
@@ -200,3 +201,59 @@ def test_prepare_for_sending_refuses_a_draft_with_nobody_to_send_to(sender_accou
     orphan.set_content("...")
     with pytest.raises(ComposeError, match="nobody to send it to"):
         prepare_for_sending(parse_message(orphan.as_bytes()))
+
+
+def test_message_goes_out_as_the_chosen_identity(sender_account):
+    sender_account.aliases = ["contact@rslt.fr"]
+    outgoing = build_message(
+        sender_account, to="bob@example.test", subject="x", body="y",
+        from_address="contact@rslt.fr",
+    )
+    assert outgoing.message["From"] == "Ada Lovelace <contact@rslt.fr>"
+    assert outgoing.envelope_from == "contact@rslt.fr"
+    assert "@rslt.fr>" in outgoing.message["Message-ID"]
+
+
+def test_an_unauthorised_from_is_refused_before_anything_is_sent(sender_account):
+    from mail_mcp.accounts import AccountConfigError
+
+    with pytest.raises(AccountConfigError):
+        build_message(
+            sender_account, to="bob@example.test", subject="x", body="y",
+            from_address="ceo@victim.test",
+        )
+
+
+def test_reply_answers_from_the_address_that_was_written_to(sender_account):
+    from email.message import EmailMessage
+
+    sender_account.aliases = ["contact@rslt.fr"]
+    incoming = EmailMessage()
+    incoming["Subject"] = "Demande"
+    incoming["From"] = "Client <client@example.test>"
+    incoming["To"] = "contact@rslt.fr"
+    incoming["Message-ID"] = "<demande@example.test>"
+    incoming.set_content("Bonjour")
+
+    reply = build_reply(sender_account, parse_message(incoming.as_bytes()), body="Bonjour")
+    assert reply.message["From"] == "Ada Lovelace <contact@rslt.fr>"
+    assert reply.envelope_from == "contact@rslt.fr"
+
+
+def test_reply_all_does_not_copy_any_of_my_own_identities(sender_account):
+    from email.message import EmailMessage
+
+    sender_account.aliases = ["contact@rslt.fr"]
+    incoming = EmailMessage()
+    incoming["Subject"] = "Demande"
+    incoming["From"] = "client@example.test"
+    incoming["To"] = "contact@rslt.fr, ada@example.test"
+    incoming["Cc"] = "someone@example.test"
+    incoming.set_content("Bonjour")
+
+    reply = build_reply(
+        sender_account, parse_message(incoming.as_bytes()), body="ok", reply_all=True
+    )
+    assert "contact@rslt.fr" not in reply.recipients
+    assert "ada@example.test" not in reply.recipients
+    assert "someone@example.test" in reply.recipients
