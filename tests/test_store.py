@@ -169,3 +169,57 @@ async def test_store_survives_a_reload(store, store_path):
     assert reloaded is not None
     assert reloaded.accounts[0].secret == "hunter2"
     assert reloaded.client_secret == connection.client_secret
+
+
+async def test_a_refresh_token_outlives_its_access_token(store):
+    connection = await store.create_connection(owner_id="usr_1", label="Work")
+    await store.save_token(
+        OAuthTokenRecord(
+            token="at_1", client_id=connection.client_id, scopes=["mail"],
+            expires_at=time.time() + 3600,
+        ),
+        refresh_token="rt_1",
+        refresh_expires_at=time.time() + 86400,
+    )
+
+    await store.expire_access("at_1")
+    assert store.get_token("at_1") is None
+    surviving = store.get_refresh("rt_1")
+    assert surviving is not None
+    assert surviving.client_id == connection.client_id
+    assert surviving.scopes == ["mail"]
+
+
+async def test_revoking_still_takes_the_refresh_token_with_it(store):
+    await store.save_token(
+        OAuthTokenRecord(token="at_2", client_id="mail_x", expires_at=time.time() + 60),
+        refresh_token="rt_2",
+    )
+    await store.revoke("at_2")
+    assert store.get_refresh("rt_2") is None
+
+
+async def test_an_expired_refresh_token_is_refused(store):
+    await store.save_token(
+        OAuthTokenRecord(token="at_3", client_id="mail_x", expires_at=time.time() + 60),
+        refresh_token="rt_3",
+        refresh_expires_at=time.time() - 1,
+    )
+    assert store.get_refresh("rt_3") is None
+
+
+async def test_an_unreadable_store_is_kept_rather_than_overwritten(tmp_path):
+    path = tmp_path / "store.json"
+    path.write_text("{ this is not json")
+
+    store = ConnectionStore(str(path))
+    assert store.list_connections() == []
+
+    kept = list(tmp_path.glob("store.json.unreadable-*"))
+    assert kept, "the unreadable file must survive for the operator to recover"
+    assert kept[0].read_text() == "{ this is not json"
+
+    # And the fresh store writes to the normal path, not over the kept copy.
+    await store.create_connection(owner_id="usr_1", label="New")
+    assert path.exists()
+    assert kept[0].read_text() == "{ this is not json"

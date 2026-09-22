@@ -161,8 +161,16 @@ class ActivityLog:
         try:
             with self._lock:
                 self._path.parent.mkdir(parents=True, exist_ok=True)
+                new_file = not self._path.exists()
                 with self._path.open("a", encoding="utf-8") as handle:
                     handle.write(entry.to_json() + "\n")
+                if new_file:
+                    # It records subjects and recipients, so it is no more
+                    # readable than the store it sits beside.
+                    try:
+                        self._path.chmod(0o600)
+                    except OSError:
+                        pass
                 self._since_trim += 1
                 # Amortise trimming: check once every 10% of the budget.
                 if self._since_trim >= max(50, self._max_entries // 10):

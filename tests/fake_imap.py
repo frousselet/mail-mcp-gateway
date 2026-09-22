@@ -180,6 +180,16 @@ class _Handler(socketserver.StreamRequestHandler):
             name = self._unquote(args)
             self.state.folders.setdefault(name, Mailbox(name))
             self._send(f"{tag} OK CREATE completed")
+        elif command == "EXPUNGE":
+            # The folder-wide form: every \\Deleted message goes, whoever flagged it.
+            mailbox = self.selected
+            if mailbox is None:
+                self._send(f"{tag} BAD no mailbox selected")
+            else:
+                for uid, (_, flags) in list(mailbox.messages.items()):
+                    if "\\Deleted" in flags:
+                        mailbox.messages.pop(uid, None)
+                self._send(f"{tag} OK EXPUNGE completed")
         elif command == "APPEND":
             self._append(tag, args)
         elif command == "UID":

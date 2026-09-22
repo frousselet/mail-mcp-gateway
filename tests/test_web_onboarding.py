@@ -308,3 +308,43 @@ async def test_the_session_key_survives_a_restart(monkeypatch):
     monkeypatch.delenv("MAIL_SECRET_KEY", raising=False)
     assert web._session_secret() == web._session_secret()
     assert web._session_secret() == server.STORE.session_secret()
+
+
+async def test_signing_out_retires_the_cookie_that_was_already_issued(monkeypatch):
+    """Clearing the session only tells this browser to forget; a copy would live on.
+
+    No `client` fixture here: that one stubs out _uid, which is the function
+    under test.
+    """
+    store = server.STORE
+    await store.create_user("epoch@example.test")
+    uid = store.find_user_by_email("epoch@example.test")
+
+    # A cookie minted before the sign-out.
+    stale_session = {"uid": uid, "email": "epoch@example.test", "epoch": 0}
+    request = type("R", (), {"session": stale_session})()
+    monkeypatch.setattr(web, "_store", lambda: store)
+    assert web._uid(request) == uid
+
+    await store.bump_session_epoch(uid)
+    assert web._uid(request) is None, "the pre-sign-out cookie still worked"
+
+
+async def test_a_probe_failure_never_echoes_the_remote_response(client, imap_server):
+    response = await client.post(
+        "/test", json=_mailbox_form(imap_server, password="wrong")
+    )
+    payload = response.json()
+    assert payload["ok"] is False
+    assert "login rejected" in payload["message"].lower()
+    # The server's own words stay in the log, not in the browser.
+    assert "app password" not in payload["message"]
+
+
+async def test_pages_with_secrets_are_not_cached(client):
+    connection_id = await _new_connector(client)
+    page = await client.get(f"/connections/{connection_id}/credentials")
+    assert page.headers["cache-control"] == "no-store"
+    assert (await client.get("/logs")).headers["cache-control"] == "no-store"
+    # The fingerprinted assets stay cacheable; that is the point of the hash.
+    assert "immutable" in (await client.get("/assets/app.css")).headers["cache-control"]

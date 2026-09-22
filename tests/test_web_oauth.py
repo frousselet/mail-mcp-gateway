@@ -335,3 +335,66 @@ async def test_web_pages_require_a_session(client):
     assert (await client.get("/")).status_code == 303
     assert (await client.post("/discover", json={"address": "a@b.c"})).status_code == 401
     assert (await client.post("/test", json={})).status_code == 401
+
+
+async def test_an_expired_access_token_does_not_kill_the_connector(client, connection):
+    """The failure mode: one call an hour later, and the connector is dead."""
+    import time as _time
+
+    from mail_mcp import server
+
+    verifier, challenge = _pkce()
+    response = await client.get(
+        "/authorize",
+        params={
+            "response_type": "code",
+            "client_id": connection.client_id,
+            "redirect_uri": REDIRECT_URI,
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            "scope": "mail",
+        },
+    )
+    code = re.search(r"code=([^&]+)", response.headers["location"]).group(1)
+    tokens = (
+        await client.post(
+            "/token",
+            data={
+                "grant_type": "authorization_code",
+                "code": code,
+                "client_id": connection.client_id,
+                "client_secret": connection.client_secret,
+                "code_verifier": verifier,
+                "redirect_uri": REDIRECT_URI,
+            },
+        )
+    ).json()
+
+    # Age the access token past its expiry, the way an hour of idling would.
+    store = server.STORE
+    token_hash = store._hash(tokens["access_token"])
+    store._data["tokens"][token_hash]["expires_at"] = _time.time() - 1
+
+    # A call with the stale token is rejected, as it should be.
+    stale = await client.post(
+        "/mcp",
+        headers={
+            "Authorization": f"Bearer {tokens['access_token']}",
+            "Accept": "application/json, text/event-stream",
+        },
+        json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+    )
+    assert stale.status_code == 401
+
+    # ...and the refresh token still works, so the agent recovers by itself.
+    refreshed = await client.post(
+        "/token",
+        data={
+            "grant_type": "refresh_token",
+            "refresh_token": tokens["refresh_token"],
+            "client_id": connection.client_id,
+            "client_secret": connection.client_secret,
+        },
+    )
+    assert refreshed.status_code == 200, refreshed.text
+    assert refreshed.json()["access_token"] != tokens["access_token"]

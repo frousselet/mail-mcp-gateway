@@ -92,7 +92,17 @@ def ssl_context(verify: bool) -> ssl.SSLContext:
 
 
 def quote(value: str) -> str:
-    """Quote a string for an IMAP command argument."""
+    """Quote a string for an IMAP command argument.
+
+    Control characters are refused rather than escaped: a CR or LF ends the
+    command line early and turns the rest of the argument into a command of its
+    own, which quoting cannot prevent.
+    """
+    for character in value:
+        if character in "\r\n\x00" or (ord(character) < 0x20 and character != "\t"):
+            raise ImapError(
+                "That name contains a control character, which IMAP does not allow."
+            )
     escaped = value.replace("\\", "\\\\").replace('"', '\\"')
     return f'"{escaped}"'
 
@@ -226,7 +236,21 @@ class ImapClient:
             await self._drop()
 
     def has_capability(self, name: str) -> bool:
+        """Whether the server advertises a capability.
+
+        Only meaningful once connected: before that the set is empty, which is
+        why the decisions that depend on it are taken inside the command, with
+        the live connection in hand, rather than ahead of it.
+        """
         return name.upper() in self._capabilities
+
+    @staticmethod
+    def _advertises(conn: imaplib.IMAP4, name: str) -> bool:
+        """Read a capability off the live connection."""
+        return name.upper() in {
+            (capability.decode() if isinstance(capability, bytes) else capability).upper()
+            for capability in (conn.capabilities or ())
+        }
 
     async def check(self) -> dict[str, Any]:
         """Open a connection and report what the server supports."""
@@ -527,9 +551,11 @@ class ImapClient:
         source = await self.resolve_folder(folder)
         target = await self.resolve_folder(destination)
         uid_set = ",".join(str(u) for u in uids)
-        can_move = self.has_capability("MOVE")
 
         def _move(conn: imaplib.IMAP4):
+            # Decided here, not above: before the first command the capability
+            # set is empty, and guessing wrong means the destructive fallback.
+            can_move = self._advertises(conn, "MOVE")
             status, data = conn.select(quote(source), readonly=False)
             if status != "OK":
                 raise ImapError(
@@ -543,8 +569,10 @@ class ImapClient:
             if status != "OK":
                 return status, data
             conn.uid("STORE", uid_set, "+FLAGS.SILENT", "(\\Deleted)")
-            if self.has_capability("UIDPLUS"):
+            if self._advertises(conn, "UIDPLUS"):
                 return conn.uid("EXPUNGE", uid_set)
+            # Neither MOVE nor UIDPLUS: the only way left removes every message
+            # in the folder that anyone has flagged deleted. The tool says so.
             return conn.expunge()
 
         status, data = await self._call(_move)
@@ -560,13 +588,21 @@ class ImapClient:
         With UIDPLUS the expunge is restricted to ``uids``; without it the
         server can only expunge the whole folder, so anything another client
         flagged as deleted goes too. The return value says which happened.
+
+        An empty ``uids`` list means "these messages", not "every message":
+        it expunges nothing. Only ``uids=None`` asks for the folder-wide form.
         """
         self._guard_read_only("expunging messages")
+        if uids is not None and not uids:
+            return "none"
         raw = await self.resolve_folder(folder)
-        targeted = bool(uids) and self.has_capability("UIDPLUS")
         uid_set = ",".join(str(u) for u in (uids or []))
+        scope = "folder"
 
         def _expunge(conn: imaplib.IMAP4):
+            nonlocal scope
+            targeted = bool(uids) and self._advertises(conn, "UIDPLUS")
+            scope = "uids" if targeted else "folder"
             status, data = conn.select(quote(raw), readonly=False)
             if status != "OK":
                 raise ImapError(
@@ -581,7 +617,7 @@ class ImapClient:
         status, data = await self._call(_expunge)
         if status != "OK":
             raise ImapError("Could not expunge the folder.", detail=_first(data))
-        return "uids" if targeted else "folder"
+        return scope
 
     async def append(
         self,

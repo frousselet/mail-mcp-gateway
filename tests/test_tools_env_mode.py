@@ -388,3 +388,24 @@ async def test_draft_written_as_an_alias_is_sent_as_that_alias(
     uid = max(imap_server.state.folders["Drafts"].messages)
     await tools.send_draft(uid=uid)
     assert b"From: contact@rslt.fr" in sent_messages[0]["raw"].replace(b"\r\n ", b"")
+
+
+async def test_delete_without_uids_refuses_instead_of_emptying_the_folder(tools, imap_server):
+    before = sorted(imap_server.state.folders["INBOX"].messages)
+    out = await tools.delete_messages(uids=[], permanent=True)
+    assert out.startswith("Error:")
+    assert "nothing to delete" in out
+    assert sorted(imap_server.state.folders["INBOX"].messages) == before
+
+
+async def test_move_without_uids_refuses(tools):
+    out = await tools.move_messages(uids=[], destination="trash")
+    assert out.startswith("Error:")
+    assert "nothing to move" in out
+
+
+async def test_create_folder_respects_a_read_only_mailbox(tools, account, imap_server):
+    account.read_only = True
+    out = await tools.create_folder(name="Nouveau")
+    assert "read-only" in out
+    assert "Nouveau" not in imap_server.state.folders

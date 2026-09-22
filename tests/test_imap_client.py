@@ -144,3 +144,64 @@ async def test_reconnects_after_the_server_drops_the_link(client, imap_server):
     client._conn.sock.close()
     status = await client.status("INBOX")
     assert status["messages"] == 3
+
+
+# ---------------------------------------------------------------------------
+# An empty selection means "these messages", never "every message"
+# ---------------------------------------------------------------------------
+
+
+async def test_an_empty_uid_list_expunges_nothing(client, imap_server):
+    """The folder-wide form would destroy whatever another client flagged."""
+    inbox = imap_server.state.folders["INBOX"]
+    raw, flags = inbox.messages[2]
+    inbox.messages[2] = (raw, flags | {"\\Deleted"})  # someone else's pending delete
+
+    assert await client.expunge("INBOX", []) == "none"
+    assert sorted(inbox.messages) == [1, 2, 3]
+
+
+async def test_expunging_a_named_uid_leaves_the_others_alone(client, imap_server):
+    inbox = imap_server.state.folders["INBOX"]
+    for uid in (1, 2):
+        raw, flags = inbox.messages[uid]
+        inbox.messages[uid] = (raw, flags | {"\\Deleted"})
+
+    await client.expunge("INBOX", [1])
+    assert sorted(inbox.messages) == [2, 3], "only the named message goes"
+
+
+async def test_the_folder_wide_form_is_reachable_but_explicit(client, imap_server):
+    inbox = imap_server.state.folders["INBOX"]
+    raw, flags = inbox.messages[3]
+    inbox.messages[3] = (raw, flags | {"\\Deleted"})
+
+    assert await client.expunge("INBOX", None) == "folder"
+    assert sorted(inbox.messages) == [1, 2]
+
+
+async def test_a_fresh_client_still_uses_the_safe_path(account, imap_server):
+    """Capabilities are empty until the first command: the old code guessed."""
+    client = ImapClient(account)
+    inbox = imap_server.state.folders["INBOX"]
+    raw, flags = inbox.messages[2]
+    inbox.messages[2] = (raw, flags | {"\\Deleted"})  # another client's pending delete
+
+    # The very first command this connection runs is the expunge.
+    assert await client.expunge("INBOX", [1]) == "uids"
+    assert 2 in inbox.messages, "an unrelated flagged message was destroyed"
+    await client.close()
+
+
+async def test_a_fresh_client_moves_with_MOVE_rather_than_copy_and_expunge(
+    account, imap_server
+):
+    client = ImapClient(account)
+    inbox = imap_server.state.folders["INBOX"]
+    raw, flags = inbox.messages[3]
+    inbox.messages[3] = (raw, flags | {"\\Deleted"})
+
+    await client.move("INBOX", [1], "Trash")
+    assert 3 in inbox.messages, "the fallback expunge ran on a MOVE-capable server"
+    assert len(imap_server.state.folders["Trash"].messages) == 1
+    await client.close()

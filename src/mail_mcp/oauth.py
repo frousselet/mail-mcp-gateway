@@ -130,10 +130,7 @@ class MailOAuthProvider(
     async def load_refresh_token(
         self, client: OAuthClientInformationFull, refresh_token: str
     ) -> RefreshToken | None:
-        access_hash = self._store.get_refresh_access_hash(refresh_token)
-        if access_hash is None:
-            return None
-        record = self._store.get_token_by_hash(access_hash)
+        record = self._store.get_refresh(refresh_token)
         if record is None or record.client_id != client.client_id:
             return None
         return RefreshToken(
@@ -161,7 +158,9 @@ class MailOAuthProvider(
         if record is None:
             return None
         if record.expires_at < time.time():
-            await self._store.revoke(token)
+            # Expiry is routine: drop this token only. Revoking would take the
+            # refresh token with it, which is what the client needs next.
+            await self._store.expire_access(token)
             return None
         return AccessToken(
             token=token,
@@ -178,14 +177,16 @@ class MailOAuthProvider(
     async def _issue_tokens(self, client_id: str, scopes: list[str]) -> OAuthToken:
         access = "at_" + secrets.token_urlsafe(32)
         refresh = "rt_" + secrets.token_urlsafe(32)
+        now = time.time()
         await self._store.save_token(
             OAuthTokenRecord(
                 token=access,
                 client_id=client_id,
                 scopes=scopes,
-                expires_at=time.time() + ACCESS_TTL,
+                expires_at=now + ACCESS_TTL,
             ),
             refresh_token=refresh,
+            refresh_expires_at=now + REFRESH_TTL,
         )
         return OAuthToken(
             access_token=access,

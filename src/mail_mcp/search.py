@@ -52,7 +52,25 @@ def imap_date(value: str | date | datetime) -> str:
     )
 
 
+def _reject_control_characters(value: str, field: str = "value") -> None:
+    """Refuse anything that could end the IMAP command line.
+
+    IMAP commands are CRLF-terminated and ``imaplib`` appends that terminator
+    without inspecting what it is sending, so a carriage return inside an
+    argument does not stay inside the argument: everything after it is read by
+    the server as a new command on the same authenticated connection. Quoting
+    cannot help, because the line ends before the closing quote is reached.
+    """
+    for character in value:
+        if character in "\r\n\x00" or (ord(character) < 0x20 and character != "\t"):
+            raise SearchError(
+                f"The {field} contains a control character, which IMAP does not "
+                "allow inside a search term. Remove it and try again."
+            )
+
+
 def _quoted(value: str) -> bytes:
+    _reject_control_characters(value, "search term")
     escaped = value.replace("\\", "\\\\").replace('"', '\\"')
     return b'"' + escaped.encode("utf-8") + b'"'
 
@@ -109,6 +127,9 @@ def build_criteria(
     if larger_than:
         criteria += [b"LARGER", str(int(larger_than)).encode()]
     if raw:
+        # split() already drops newlines, but be explicit: this is the one
+        # argument whose tokens are passed through unquoted.
+        _reject_control_characters(raw, "raw query")
         criteria += [token.encode("utf-8") for token in raw.split()]
 
     return criteria or [b"ALL"]

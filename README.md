@@ -250,6 +250,21 @@ picks the one to act on.
   every write checks ownership.
 - Deleting a connector, or issuing it a new secret, immediately revokes the
   tokens already handed out.
+- Every value that reaches an IMAP command is refused if it carries a control
+  character. A carriage return inside a search term would otherwise end the
+  command line and let whatever followed run as a command of its own, on the
+  authenticated connection: a subject line from a stranger was enough.
+- Destructive operations refuse an empty selection instead of treating it as
+  "everything", and server capabilities are read from the live connection, so a
+  first call cannot fall back to a folder-wide expunge by accident.
+- An access token that expires takes nothing with it: the refresh token beside
+  it keeps working, so a connector recovers on its own instead of needing to be
+  authorized again by hand.
+- A store file that cannot be read is set aside rather than overwritten.
+- Signing out retires every session cookie already issued to that user, not just
+  the one in the browser doing it.
+- Connection tests report why they failed without echoing the remote server's
+  response, which would otherwise make them a way to read internal pages.
 - `MAIL_ONBOARD_CODE` gates self-registration when the gateway is reachable
   from the internet; without it, anyone who can open the page can create an
   account, and the UI says so on the Passkeys page.
@@ -300,7 +315,7 @@ every variable.
 
 ```bash
 uv venv && uv pip install -e ".[dev]"
-uv run pytest        # 282 tests, including fake IMAP and CalDAV servers
+uv run pytest        # 312 tests, including fake IMAP and CalDAV servers
 uv run ruff check src tests
 ```
 

@@ -738,7 +738,15 @@ async def get_thread(
         mail_account, client = _resolve(account)
         raw = await client.fetch_raw(folder, uid)
         parsed = parse_message(raw)
-        base_subject = parsed.subject
+        # The subject comes off the wire from whoever sent the message, and it
+        # is about to become a search term: strip anything that is not text
+        # rather than refusing, so a malformed subject does not make the thread
+        # unreadable.
+        base_subject = "".join(
+            character
+            for character in parsed.subject
+            if character.isprintable() or character == " "
+        ).strip()
         for prefix in ("re:", "fwd:", "fw:", "tr:", "rép:", "rep:"):
             while base_subject.lower().startswith(prefix):
                 base_subject = base_subject[len(prefix):].strip()
@@ -1313,11 +1321,21 @@ async def move_messages(
     try:
         mail_account, client = _resolve(account)
         targets = _uid_list(uids)
+        if not targets:
+            return "Error: no UID was given, so there is nothing to move."
         count = await client.move(folder, targets, destination)
+        warning = ""
+        if not client.has_capability("MOVE") and not client.has_capability("UIDPLUS"):
+            warning = (
+                "This server supports neither MOVE nor UIDPLUS, so the copy was "
+                "followed by a folder-wide expunge: anything else already flagged "
+                "as deleted in that folder was removed too."
+            )
         return formatting.format_action(
             f"Moved {count} message(s) from {folder} to {destination} "
             f"({mail_account.address}).",
             note="UIDs change on move; list the destination folder to get the new ones.",
+            warning=warning,
         )
     except Exception as e:
         return _handle(e)
@@ -1341,6 +1359,11 @@ async def delete_messages(
     try:
         mail_account, client = _resolve(account)
         targets = _uid_list(uids)
+        if not targets:
+            return (
+                "Error: no UID was given, so there is nothing to delete. "
+                "List the folder first and pass the UIDs you mean."
+            )
         if not permanent:
             trash = await client.folder_for_role("trash")
             if trash:
@@ -1375,6 +1398,7 @@ async def create_folder(name: str, account: str | None = None) -> str:
     """
     try:
         mail_account, client = _resolve(account)
+        _ensure_writable(mail_account, "creating folders")
         created = await client.create_folder(name)
         return formatting.format_action(
             f"Created folder {created!r} in {mail_account.address}."

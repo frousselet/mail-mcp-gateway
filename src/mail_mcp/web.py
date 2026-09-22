@@ -131,7 +131,22 @@ def _rp_id(request: Request) -> str:
 
 
 def _uid(request: Request) -> str | None:
-    return request.session.get("uid")
+    """The signed-in user, or None when the cookie is stale.
+
+    A cookie issued before the user last signed out is refused, which is what
+    makes signing out mean something for a cookie that was copied.
+    """
+    uid = request.session.get("uid")
+    if not uid:
+        return None
+    store = _store()
+    if store is not None:
+        user = store.get_user(uid)
+        if user is None:
+            return None
+        if request.session.get("epoch", 0) < user.get("session_epoch", 0):
+            return None
+    return uid
 
 
 def _json_options(options) -> dict:
@@ -331,6 +346,7 @@ async def register_complete(request: Request) -> JSONResponse:
     )
     request.session["uid"] = uid
     request.session["email"] = email
+    request.session["epoch"] = (store.get_user(uid) or {}).get("session_epoch", 0)
     logger.info("Registered a passkey for %s", email)
     return JSONResponse({"ok": True})
 
@@ -389,6 +405,7 @@ async def login_complete(request: Request) -> JSONResponse:
     user = store.get_user(record["user_id"])
     request.session["uid"] = record["user_id"]
     request.session["email"] = user["email"] if user else ""
+    request.session["epoch"] = (user or {}).get("session_epoch", 0)
     return JSONResponse({"ok": True})
 
 
@@ -437,6 +454,17 @@ async def passkey_delete(request: Request) -> Response:
 
 @mcp.custom_route("/logout", methods=["GET"])
 async def logout(request: Request) -> RedirectResponse:
+    """Sign out, and make the cookie that was just dropped useless.
+
+    Clearing the session only tells this browser to forget it. The cookie is
+    self-contained and signed, so a copy taken beforehand would keep working
+    for its full lifetime; bumping the user's epoch retires every cookie
+    issued before now.
+    """
+    store = _store()
+    uid = _uid(request)
+    if store and uid:
+        await store.bump_session_epoch(uid)
     request.session.clear()
     return RedirectResponse("/login", status_code=303)
 
@@ -804,7 +832,11 @@ async def _probe_calendar(account: CalendarAccount) -> dict[str, Any]:
     try:
         report = await client.check()
     except CalDavError as e:
-        return {"ok": False, "message": f"{e.message} {e.detail}".strip()}
+        # The detail can carry the remote server's own response body, which is
+        # how a connection test turns into a way to read internal pages. It
+        # goes to the log; the browser gets the reason only.
+        logger.info("CalDAV probe for %s failed: %s %s", account.address, e.message, e.detail)
+        return {"ok": False, "message": e.message}
     finally:
         await client.close()
 
@@ -1031,7 +1063,8 @@ async def _probe(account: MailAccount) -> dict[str, Any]:
     try:
         report = await client.check()
     except ImapError as e:
-        return {"ok": False, "message": f"IMAP: {e.message} {e.detail}".strip()}
+        logger.info("IMAP probe for %s failed: %s %s", account.address, e.message, e.detail)
+        return {"ok": False, "message": f"IMAP: {e.message}"}
     finally:
         await client.close()
 
@@ -1039,7 +1072,8 @@ async def _probe(account: MailAccount) -> dict[str, Any]:
     try:
         await smtp_client.check(account)
     except SmtpError as e:
-        return {"ok": False, "message": f"{message} SMTP: {e.message} {e.detail}".strip()}
+        logger.info("SMTP probe for %s failed: %s %s", account.address, e.message, e.detail)
+        return {"ok": False, "message": f"{message} SMTP: {e.message}"}
     return {"ok": True, "message": f"{message} SMTP OK. These settings work."}
 
 
@@ -1168,6 +1202,9 @@ class SecurityHeaders:
                             (b"x-content-type-options", b"nosniff"),
                             (b"referrer-policy", b"same-origin"),
                             (b"x-frame-options", b"DENY"),
+                            # These pages carry client secrets and the activity
+                            # log; they must not outlive the session in a cache.
+                            (b"cache-control", b"no-store"),
                         ]
                     )
             await send(message)

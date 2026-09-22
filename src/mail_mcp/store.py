@@ -156,8 +156,24 @@ class ConnectionStore:
             return
         try:
             self._data = json.loads(self._path.read_text())
+            return
         except (json.JSONDecodeError, OSError) as e:
-            logger.error("Failed to read the store at %s: %s", self._path, e)
+            # Starting empty would be fine; the next write silently replacing
+            # every stored credential would not. Keep the file that could not
+            # be read, under a name nothing will overwrite.
+            backup = self._path.with_name(f"{self._path.name}.unreadable-{int(time.time())}")
+            try:
+                self._path.replace(backup)
+                kept = f"It has been kept as {backup.name}."
+            except OSError:
+                kept = "It could NOT be set aside, so do not restart before copying it."
+            logger.error(
+                "The store at %s could not be read (%s). Starting with an empty "
+                "store; every connector and mailbox will have to be added again. %s",
+                self._path,
+                e,
+                kept,
+            )
             self._data = {}
 
     def _flush(self) -> None:
@@ -448,6 +464,14 @@ class ConnectionStore:
     def get_user(self, user_id: str) -> dict[str, Any] | None:
         return self._data["users"].get(user_id)
 
+    async def bump_session_epoch(self, user_id: str) -> None:
+        """Retire every session cookie issued to this user so far."""
+        async with self._lock:
+            user = self._data["users"].get(user_id)
+            if user is not None:
+                user["session_epoch"] = user.get("session_epoch", 0) + 1
+                self._flush()
+
     def find_user_by_email(self, email: str) -> str | None:
         for user_id, record in self._data["users"].items():
             if record.get("email", "").lower() == email.lower():
@@ -539,7 +563,10 @@ class ConnectionStore:
     # --- OAuth tokens (stored by hash) ---
 
     async def save_token(
-        self, record: OAuthTokenRecord, refresh_token: str | None = None
+        self,
+        record: OAuthTokenRecord,
+        refresh_token: str | None = None,
+        refresh_expires_at: float = 0.0,
     ) -> None:
         async with self._lock:
             self._data["tokens"][self._hash(record.token)] = {
@@ -548,7 +575,16 @@ class ConnectionStore:
                 "expires_at": record.expires_at,
             }
             if refresh_token:
-                self._data["refresh"][self._hash(refresh_token)] = self._hash(record.token)
+                # The refresh token carries its own client and scopes. It used
+                # to be a pointer to the access token, so the first call made
+                # with an expired access token deleted the refresh token with
+                # it and the connector had to be authorized again by hand.
+                self._data["refresh"][self._hash(refresh_token)] = {
+                    "client_id": record.client_id,
+                    "scopes": record.scopes,
+                    "expires_at": refresh_expires_at,
+                    "access_hash": self._hash(record.token),
+                }
             self._flush()
 
     def get_token(self, token: str) -> OAuthTokenRecord | None:
@@ -564,18 +600,53 @@ class ConnectionStore:
         # Only the hash is stored, so the raw token is unknown here.
         return OAuthTokenRecord(token="", **record)
 
+    def get_refresh(self, refresh_token: str) -> OAuthTokenRecord | None:
+        """The connector and scopes behind a refresh token, if it is still live."""
+        record = self._data["refresh"].get(self._hash(refresh_token))
+        if not record:
+            return None
+        if isinstance(record, str):  # a pointer from an older store file
+            pointed = self._data["tokens"].get(record)
+            if not pointed:
+                return None
+            return OAuthTokenRecord(token="", **pointed)
+        if record.get("expires_at") and record["expires_at"] < time.time():
+            return None
+        return OAuthTokenRecord(
+            token="",
+            client_id=record.get("client_id", ""),
+            scopes=record.get("scopes", []),
+            expires_at=record.get("expires_at", 0.0),
+        )
+
     def get_refresh_access_hash(self, refresh_token: str) -> str | None:
-        return self._data["refresh"].get(self._hash(refresh_token))
+        """The access token a refresh token was issued beside, when known."""
+        record = self._data["refresh"].get(self._hash(refresh_token))
+        if isinstance(record, str):
+            return record
+        return record.get("access_hash") if record else None
+
+    async def expire_access(self, token: str) -> None:
+        """Drop one access token that has timed out, and nothing else.
+
+        Expiry is routine, so it must not cascade: the refresh token that came
+        with it is exactly what the client is about to use.
+        """
+        async with self._lock:
+            self._data["tokens"].pop(self._hash(token), None)
+            self._flush()
 
     async def revoke(self, token: str) -> None:
+        """Revoke a token the client asked to revoke, and what hangs off it."""
         await self.revoke_hash(self._hash(token))
 
     async def revoke_hash(self, token_hash: str) -> None:
         async with self._lock:
             self._data["tokens"].pop(token_hash, None)
             self._data["refresh"].pop(token_hash, None)
-            for refresh_hash, access_hash in list(self._data["refresh"].items()):
-                if access_hash == token_hash:
+            for refresh_hash, record in list(self._data["refresh"].items()):
+                pointed = record if isinstance(record, str) else record.get("access_hash")
+                if pointed == token_hash:
                     self._data["refresh"].pop(refresh_hash, None)
             self._flush()
 
