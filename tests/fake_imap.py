@@ -1,7 +1,7 @@
 """A tiny in-process IMAP server, just complete enough to drive ImapClient.
 
 It speaks the subset the gateway uses (CAPABILITY, LOGIN, LIST, SELECT/EXAMINE,
-STATUS, UID SEARCH/FETCH/STORE/MOVE, CREATE, APPEND, LOGOUT) over plain TCP on
+STATUS, UID SEARCH/FETCH/STORE/MOVE/COPY, CREATE, APPEND, LOGOUT) over plain TCP on
 localhost, so the IMAP code path is exercised for real rather than mocked.
 """
 
@@ -55,6 +55,8 @@ class FakeIMAPState:
             "Archives/&AMk-t&AOk- 2024": Mailbox("Archives/&AMk-t&AOk- 2024"),
         }
         self.appended: list[tuple[str, bytes]] = []
+        # Tests downgrade this to exercise the fallbacks of older servers.
+        self.capabilities = CAPABILITIES
         inbox = self.folders["INBOX"]
         inbox.add(
             _message(1, "Invoice #42", "Billing <billing@acme.test>",
@@ -82,7 +84,7 @@ class _Handler(socketserver.StreamRequestHandler):
     def handle(self) -> None:
         self.selected: Mailbox | None = None
         self.authenticated = False
-        self._send(f"* OK [CAPABILITY {CAPABILITIES}] fake IMAP ready")
+        self._send(f"* OK [CAPABILITY {self.state.capabilities}] fake IMAP ready")
         while True:
             line = self.rfile.readline()
             if not line:
@@ -127,7 +129,7 @@ class _Handler(socketserver.StreamRequestHandler):
         command = command.upper()
 
         if command == "CAPABILITY":
-            self._send(f"* CAPABILITY {CAPABILITIES}")
+            self._send(f"* CAPABILITY {self.state.capabilities}")
             self._send(f"{tag} OK CAPABILITY completed")
         elif command == "LOGIN":
             user, _, password = args.partition(" ")
@@ -248,6 +250,18 @@ class _Handler(socketserver.StreamRequestHandler):
                 raw, flags = mailbox.messages.pop(uid)
                 target.add(raw, flags)
             self._send(f"{tag} OK MOVE completed")
+        elif sub == "COPY":
+            uid_set, _, destination = rest.partition(" ")
+            target = self._folder(destination)
+            if target is None:
+                self._send(f"{tag} NO [TRYCREATE] no such mailbox")
+                return
+            for uid in self._uids(uid_set, mailbox):
+                raw, flags = mailbox.messages[uid]
+                target.add(raw, set(flags))
+            self._send(f"{tag} OK COPY completed")
+        elif sub == "EXPUNGE" and "UIDPLUS" not in self.state.capabilities:
+            self._send(f"{tag} BAD UID EXPUNGE needs UIDPLUS")
         elif sub == "EXPUNGE":
             for uid in self._uids(rest, mailbox):
                 _, flags = mailbox.messages.get(uid, (b"", set()))
@@ -274,7 +288,11 @@ class _Handler(socketserver.StreamRequestHandler):
         if tokens.upper().startswith("CHARSET "):
             tokens = tokens.partition(" ")[2].partition(" ")[2]
         matches: list[int] = []
+        by_uid = re.match(r"UID (\S+)", tokens)
+        allowed = set(self._uids(by_uid.group(1), mailbox)) if by_uid else None
         for uid, (raw, flags) in mailbox.messages.items():
+            if allowed is not None and uid not in allowed:
+                continue
             text = raw.decode("utf-8", errors="replace")
             keep = True
             upper = tokens.upper()

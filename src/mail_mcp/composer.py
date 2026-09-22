@@ -9,11 +9,11 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from email import message_from_bytes, policy
 from email.message import EmailMessage
-from email.utils import format_datetime, make_msgid, parseaddr
+from email.utils import format_datetime, getaddresses, make_msgid, parseaddr
 from typing import Any
 
 from mail_mcp.accounts import MailAccount
-from mail_mcp.message import ParsedMessage, html_to_text
+from mail_mcp.message import ParsedMessage, decode_value, display_address, html_to_text
 
 MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024
 
@@ -36,15 +36,59 @@ class OutgoingMessage:
         return self.message.as_bytes()
 
 
+def _split_outside_quotes(text: str) -> list[str]:
+    """Split on commas and semicolons, except inside "quotes" or <angles>.
+
+    ``"Doe, John" <j@x.com>, ada@x.org`` is two addresses, not three.
+    """
+    parts: list[str] = []
+    current: list[str] = []
+    quoted = escaped = False
+    angle = 0
+    for ch in text:
+        if escaped:
+            escaped = False
+        elif ch == "\\" and quoted:
+            escaped = True
+        elif ch == '"':
+            quoted = not quoted
+        elif ch == "<" and not quoted:
+            angle += 1
+        elif ch == ">" and not quoted and angle:
+            angle -= 1
+        elif ch in ",;" and not quoted and not angle:
+            parts.append("".join(current))
+            current = []
+            continue
+        current.append(ch)
+    parts.append("".join(current))
+    return [part.strip() for part in parts if part.strip()]
+
+
+def _normalise(address: str) -> str:
+    """Rewrite one address with its name quoted when it needs to be."""
+    name, addr = parseaddr(address)
+    if addr and "@" in addr:
+        return display_address(decode_value(name), addr)
+    return address  # left as given, so the server's refusal names it
+
+
 def _split_addresses(value: str | list[str] | None) -> list[str]:
     """Accept a list, or a comma/semicolon separated string, of addresses."""
     if not value:
         return []
-    if isinstance(value, str):
-        parts = [p.strip() for p in value.replace(";", ",").split(",")]
-    else:
-        parts = [str(p).strip() for p in value]
-    return [p for p in parts if p]
+    items = [value] if isinstance(value, str) else [str(v) for v in value]
+    return [
+        _normalise(part) for item in items for part in _split_outside_quotes(item)
+    ]
+
+
+def _header_line(value: Any, field: str) -> str:
+    """A header value, refused if it would span lines."""
+    text = str(value)
+    if "\r" in text or "\n" in text:
+        raise ComposeError(f"The {field} cannot contain a line break.")
+    return text
 
 
 def _bare(address: str) -> str:
@@ -126,7 +170,9 @@ def build_message(
         message["Cc"] = ", ".join(cc_list)
     if bcc_list and bcc_header:
         message["Bcc"] = ", ".join(bcc_list)
-    message["Subject"] = subject or "(no subject)"
+    # A subject taken from a received message has been flattened already;
+    # one typed by the agent with a line break in it is a mistake to report.
+    message["Subject"] = _header_line(subject or "(no subject)", "subject")
     message["Date"] = format_datetime(datetime.now(UTC))
     domain = sender.rpartition("@")[2] or "localhost"
     message["Message-ID"] = make_msgid(domain=domain)
@@ -135,7 +181,7 @@ def build_message(
         message["Reply-To"] = ", ".join(reply_list)
     for name, value in (headers or {}).items():
         if value:
-            message[name] = value
+            message[name] = _header_line(value, name)
 
     if html and not body:
         body = html_to_text(html)
@@ -366,12 +412,17 @@ def prepare_for_sending(original: ParsedMessage) -> tuple[bytes, list[str], str]
     refreshed: the draft may have been written days ago.
     """
     message = message_from_bytes(original.raw, policy=policy.default)
-    recipients = [
-        _bare(address)
-        for header in ("To", "Cc", "Bcc")
-        for address in _split_addresses(message.get(header, ""))
-    ]
-    recipients = [address for address in recipients if address]
+    recipients: list[str] = []
+    for header in ("To", "Cc", "Bcc"):
+        values = [str(v) for v in message.get_all(header, [])]
+        pairs = getaddresses(values)
+        if any(not addr for _, addr in pairs):
+            # getaddresses gives up on a malformed header as a whole; fall back
+            # to the quote-aware split rather than lose every recipient in it.
+            found = [_bare(a) for v in values for a in _split_addresses(v)]
+        else:
+            found = [addr for _, addr in pairs]
+        recipients += [a for a in found if a and a not in recipients]
     if not recipients:
         raise ComposeError("That draft has no recipient, so there is nobody to send it to.")
 

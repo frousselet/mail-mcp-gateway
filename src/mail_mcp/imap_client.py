@@ -6,6 +6,11 @@ worker thread. A dropped connection is transparently re-established once.
 
 Only UID commands are used: sequence numbers shift under concurrent expunges,
 UIDs do not, so the identifiers handed to an agent stay valid.
+
+A worker thread cannot be cancelled once started. When the task waiting on it
+is (a client that disconnects, an agent that stops), the lock is kept until the
+thread has finished, and the connection it was using is thrown away: a later
+command must never share a socket that still has someone else's reply on it.
 """
 
 from __future__ import annotations
@@ -62,6 +67,66 @@ _FALLBACK_NAMES = {
     "junk": ("Junk", "Spam", "Junk E-mail", "INBOX.Junk", "Indésirables", "Pourriel"),
     "archive": ("Archive", "Archives", "INBOX.Archive"),
 }
+
+
+# A connection idle this long is checked with NOOP before a command that must
+# not be run twice (APPEND, COPY): the reconnect-and-retry path cannot tell a
+# command that never reached the server from one whose reply was lost.
+_IDLE_CHECK_SECONDS = 60
+
+
+@dataclass
+class Outcome:
+    """What a mutation really touched, as opposed to what it was asked to."""
+
+    done: list[int] = field(default_factory=list)
+    missing: list[int] = field(default_factory=list)
+    # For moves: "moved", "uids" (copied, originals expunged one by one) or
+    # "flagged" (copied, originals only flagged deleted: no MOVE, no UIDPLUS).
+    how: str = ""
+
+    @property
+    def count(self) -> int:
+        return len(self.done)
+
+
+async def _in_thread(fn, on_abandon=None) -> Any:
+    """Run ``fn`` in a worker thread without letting cancellation outrun it.
+
+    ``asyncio.to_thread`` returns as soon as the awaiting task is cancelled,
+    while the thread carries on. Here the caller keeps waiting (so whatever lock
+    it holds stays held), then ``on_abandon`` gets the finished future to clean
+    up after it, and only then is the cancellation passed on.
+    """
+    future = asyncio.ensure_future(asyncio.to_thread(fn))
+    try:
+        return await asyncio.shield(future)
+    except asyncio.CancelledError:
+        while not future.done():
+            try:
+                await asyncio.shield(future)
+            except asyncio.CancelledError:
+                continue
+            except BaseException:
+                break
+        if not future.cancelled():
+            future.exception()  # retrieved, so asyncio does not log it
+        if on_abandon is not None:
+            await on_abandon(future)
+        raise
+
+
+def _uid_set(uids: list[int]) -> str:
+    return ",".join(str(u) for u in uids)
+
+
+def _present(conn: imaplib.IMAP4, uids: list[int]) -> list[int]:
+    """The subset of ``uids`` that exists in the selected folder."""
+    status, data = conn.uid("SEARCH", "UID", _uid_set(uids))
+    if status != "OK":
+        return list(uids)  # cannot tell: assume all, as before
+    found = {int(u) for u in (data[0] or b"").split()}
+    return [u for u in uids if u in found]
 
 
 class ImapError(RuntimeError):
@@ -185,7 +250,14 @@ class ImapClient:
             self._login_sync(conn, access_token)
             return conn
 
-        conn = await asyncio.to_thread(_open)
+        async def _close_orphan(future) -> None:
+            # Cancelled while logging in: the socket exists but nobody owns it.
+            if future.cancelled() or future.exception() is not None:
+                return
+            orphan = future.result()
+            await asyncio.to_thread(_quiet_logout, orphan)
+
+        conn = await _in_thread(_open, _close_orphan)
         self._conn = conn
         self._selected = None
         self._capabilities = {
@@ -197,20 +269,51 @@ class ImapClient:
         )
         return conn
 
+    async def _run(self, conn: imaplib.IMAP4, fn, *args, **kwargs) -> Any:
+        async def _poisoned(_future) -> None:
+            # The thread finished after its caller gave up. Whatever state it
+            # left the connection in, nobody is reading it: start afresh.
+            if self._conn is conn:
+                await self._drop()
+
+        return await _in_thread(lambda: fn(conn, *args, **kwargs), _poisoned)
+
+    async def _alive(self) -> None:
+        """Replace a connection that has gone quiet and may be dead."""
+        conn = self._conn
+        if conn is None or time.time() - self._last_used < _IDLE_CHECK_SECONDS:
+            return
+        try:
+            await self._run(conn, lambda c: c.noop())
+        except (imaplib.IMAP4.error, OSError, ssl.SSLError):
+            await self._drop()
+
     async def _call(self, fn, *args, retry: bool = True, **kwargs) -> Any:
-        """Run one IMAP command, reconnecting once if the link went away."""
+        """Run one IMAP command, reconnecting once if the link went away.
+
+        ``retry=False`` is for commands that must not run twice (APPEND, COPY):
+        if the link breaks mid-command, the server may already have done it.
+        Those check an idle connection first instead, which covers the common
+        case of a server that closed it while nothing was happening.
+        """
         async with self._lock:
+            if not retry:
+                await self._alive()
             conn = await self._ensure_conn()
             try:
-                result = await asyncio.to_thread(lambda: fn(conn, *args, **kwargs))
+                result = await self._run(conn, fn, *args, **kwargs)
             except (imaplib.IMAP4.abort, OSError, ssl.SSLError) as e:
                 logger.warning("IMAP connection lost (%s); reconnecting", e)
                 await self._drop()
                 if not retry:
-                    raise ImapError("IMAP connection lost.", detail=str(e)) from e
+                    raise ImapError(
+                        "IMAP connection lost in the middle of a change; it may or "
+                        "may not have been applied. Check before trying again.",
+                        detail=str(e),
+                    ) from e
                 conn = await self._ensure_conn()
                 try:
-                    result = await asyncio.to_thread(lambda: fn(conn, *args, **kwargs))
+                    result = await self._run(conn, fn, *args, **kwargs)
                 except (imaplib.IMAP4.error, OSError, ssl.SSLError) as e2:
                     raise ImapError("IMAP command failed.", detail=_readable(e2)) from e2
             except imaplib.IMAP4.error as e:
@@ -223,13 +326,7 @@ class ImapClient:
         if conn is None:
             return
 
-        def _close() -> None:
-            try:
-                conn.logout()
-            except Exception:
-                pass
-
-        await asyncio.to_thread(_close)
+        await asyncio.to_thread(_quiet_logout, conn)
 
     async def close(self) -> None:
         async with self._lock:
@@ -451,7 +548,7 @@ class ImapClient:
         total = len(uids)
         if not use_sort and newest_first:
             uids.reverse()
-        return uids[: max(1, limit)], total
+        return uids[: max(0, limit)], total
 
     # --- fetch ---------------------------------------------------------------
 
@@ -520,16 +617,22 @@ class ImapClient:
 
     async def store_flags(
         self, folder: str | None, uids: list[int], flags: list[str], *, add: bool = True
-    ) -> int:
+    ) -> Outcome:
+        """Add or remove flags; reports which UIDs were really there.
+
+        A server answers OK to a STORE on UIDs that do not exist, so the count
+        comes from a search in the same selection, not from the request.
+        """
         self._guard_read_only("changing flags")
         if not uids:
-            return 0
+            return Outcome()
         raw = await self.resolve_folder(folder)
-        uid_set = ",".join(str(u) for u in uids)
         command = "+FLAGS.SILENT" if add else "-FLAGS.SILENT"
         flag_arg = "(" + " ".join(flags) + ")"
+        present: list[int] = []
 
         def _store(conn: imaplib.IMAP4):
+            nonlocal present
             status, data = conn.select(quote(raw), readonly=False)
             if status != "OK":
                 raise ImapError(
@@ -537,22 +640,36 @@ class ImapClient:
                     detail=_first(data),
                 )
             self._selected = (raw, False)
-            return conn.uid("STORE", uid_set, command, flag_arg)
+            present = _present(conn, uids)
+            if not present:
+                return "OK", [b""]
+            return conn.uid("STORE", _uid_set(present), command, flag_arg)
 
         status, data = await self._call(_store)
         if status != "OK":
             raise ImapError("Could not update message flags.", detail=_first(data))
-        return len(uids)
+        return Outcome(done=present, missing=[u for u in uids if u not in present])
 
-    async def move(self, folder: str | None, uids: list[int], destination: str) -> int:
+    async def move(
+        self, folder: str | None, uids: list[int], destination: str
+    ) -> Outcome:
+        """Move messages; reports which UIDs moved and how.
+
+        Without MOVE the gateway copies, then flags the originals deleted. With
+        UIDPLUS it expunges exactly those; without it, it stops there, because
+        the only expunge left would also destroy every other message someone
+        flagged deleted in that folder.
+        """
         self._guard_read_only("moving messages")
         if not uids:
-            return 0
+            return Outcome()
         source = await self.resolve_folder(folder)
         target = await self.resolve_folder(destination)
-        uid_set = ",".join(str(u) for u in uids)
+        present: list[int] = []
+        how = "moved"
 
         def _move(conn: imaplib.IMAP4):
+            nonlocal present, how
             # Decided here, not above: before the first command the capability
             # set is empty, and guessing wrong means the destructive fallback.
             can_move = self._advertises(conn, "MOVE")
@@ -563,6 +680,10 @@ class ImapClient:
                     detail=_first(data),
                 )
             self._selected = (source, False)
+            present = _present(conn, uids)
+            if not present:
+                return "OK", [b""]
+            uid_set = _uid_set(present)
             if can_move:
                 return conn.uid("MOVE", uid_set, quote(target))
             status, data = conn.uid("COPY", uid_set, quote(target))
@@ -570,24 +691,37 @@ class ImapClient:
                 return status, data
             conn.uid("STORE", uid_set, "+FLAGS.SILENT", "(\\Deleted)")
             if self._advertises(conn, "UIDPLUS"):
+                how = "uids"
                 return conn.uid("EXPUNGE", uid_set)
-            # Neither MOVE nor UIDPLUS: the only way left removes every message
-            # in the folder that anyone has flagged deleted. The tool says so.
-            return conn.expunge()
+            how = "flagged"
+            return status, data
 
-        status, data = await self._call(_move)
+        # Never retried: a COPY that ran before the link dropped would be
+        # copied a second time.
+        status, data = await self._call(_move, retry=False)
         if status != "OK":
             raise ImapError(
                 f"Could not move messages to {destination!r}.", detail=_first(data)
             )
-        return len(uids)
+        return Outcome(
+            done=present, missing=[u for u in uids if u not in present], how=how
+        )
 
-    async def expunge(self, folder: str | None, uids: list[int] | None = None) -> str:
+    async def expunge(
+        self,
+        folder: str | None,
+        uids: list[int] | None = None,
+        *,
+        allow_folder_wide: bool = True,
+    ) -> str:
         """Permanently remove messages flagged ``\\Deleted``.
 
         With UIDPLUS the expunge is restricted to ``uids``; without it the
         server can only expunge the whole folder, so anything another client
-        flagged as deleted goes too. The return value says which happened.
+        flagged as deleted goes too. With ``allow_folder_wide=False`` that
+        fallback is not taken and the messages stay flagged ("flagged").
+        The return value says which happened: "uids", "folder", "flagged" or
+        "none".
 
         An empty ``uids`` list means "these messages", not "every message":
         it expunges nothing. Only ``uids=None`` asks for the folder-wide form.
@@ -603,6 +737,9 @@ class ImapClient:
             nonlocal scope
             targeted = bool(uids) and self._advertises(conn, "UIDPLUS")
             scope = "uids" if targeted else "folder"
+            if not targeted and uids and not allow_folder_wide:
+                scope = "flagged"
+                return "OK", [b""]
             status, data = conn.select(quote(raw), readonly=False)
             if status != "OK":
                 raise ImapError(
@@ -640,7 +777,8 @@ class ImapClient:
         def _append(conn: imaplib.IMAP4):
             return conn.append(quote(raw), flags, stamp, message)
 
-        status, data = await self._call(_append)
+        # Never retried: an APPEND whose reply was lost may already be stored.
+        status, data = await self._call(_append, retry=False)
         if status != "OK":
             raise ImapError(
                 f"Could not save the message to {mutf7.decode(raw)!r}.",
@@ -650,6 +788,13 @@ class ImapClient:
         self._selected = None
         match = _APPENDUID_RE.search(_first(data).encode())
         return int(match.group(1)) if match else None
+
+
+def _quiet_logout(conn: imaplib.IMAP4) -> None:
+    try:
+        conn.logout()
+    except Exception:
+        pass
 
 
 def _first(data: Any) -> str:

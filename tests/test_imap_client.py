@@ -106,7 +106,7 @@ async def test_store_flags_marks_read(client, imap_server):
 
 async def test_move_uses_the_move_capability(client, imap_server):
     moved = await client.move("INBOX", [1], "Trash")
-    assert moved == 1
+    assert moved.done == [1] and moved.how == "moved"
     assert 1 not in imap_server.state.folders["INBOX"].messages
     assert len(imap_server.state.folders["Trash"].messages) == 1
 

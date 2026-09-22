@@ -19,6 +19,11 @@ from html.parser import HTMLParser
 from typing import Any, ClassVar
 
 _WS_RE = re.compile(r"[ \t]+")
+# A header is one line. An encoded word can decode to a line break, which the
+# email package then refuses to write back (a reply to such a subject would
+# fail every time), so decoded values are flattened.
+_HEADER_BREAKS_RE = re.compile(r"[\r\n\x00\u2028\u2029]+")
+_SPECIALS = set('()<>@,;:\\".[]')
 _BLANKS_RE = re.compile(r"\n{3,}")
 
 
@@ -29,23 +34,42 @@ def decode_value(value: str | bytes | None) -> str:
     if isinstance(value, bytes):
         value = value.decode("utf-8", errors="replace")
     try:
-        return str(make_header(decode_header(value))).strip()
+        text = str(make_header(decode_header(str(value))))
     except (UnicodeDecodeError, LookupError, ValueError):
-        return value.strip()
+        text = str(value)
+    return " ".join(_HEADER_BREAKS_RE.sub(" ", text).split())
+
+
+def display_address(name: str, addr: str) -> str:
+    """``Name <addr>``, with the name quoted when RFC 5322 requires it.
+
+    ``Doe, John <j@x>`` would read as two addresses; ``"Doe, John" <j@x>``
+    is one. Unlike ``email.utils.formataddr``, non-ASCII names stay readable
+    rather than being RFC 2047 encoded: the email package encodes them when
+    the header is written.
+    """
+    if not name:
+        return addr
+    if any(ch in _SPECIALS for ch in name):
+        escaped = name.replace("\\", "\\\\").replace('"', '\\"')
+        name = f'"{escaped}"'
+    return f"{name} <{addr}>" if addr else name
 
 
 def addresses(value: str | None) -> list[str]:
-    """Split an address header into ``Name <addr>`` strings, decoded."""
+    """Split an address header into ``Name <addr>`` strings, decoded.
+
+    The header is split first and each name decoded afterwards: decoding first
+    turns an encoded ``Dupont, Élise`` into a bare comma that splits one
+    person into two.
+    """
     if not value:
         return []
     out: list[str] = []
-    for name, addr in getaddresses([decode_value(value)]):
-        if name and addr:
-            out.append(f"{name} <{addr}>")
-        elif addr:
-            out.append(addr)
-        elif name:
-            out.append(name)
+    for name, addr in getaddresses([str(value)]):
+        name = decode_value(name)
+        if name or addr:
+            out.append(display_address(name, addr))
     return out
 
 
@@ -53,7 +77,7 @@ def address_only(value: str | None) -> list[str]:
     """Just the bare addresses from a header."""
     if not value:
         return []
-    return [addr for _, addr in getaddresses([decode_value(value)]) if addr]
+    return [addr for _, addr in getaddresses([str(value)]) if addr]
 
 
 def parse_date(value: str | None) -> datetime | None:
@@ -217,11 +241,13 @@ def parse_message(raw: bytes) -> ParsedMessage:
             if content_type == "text/html" and not parsed.html:
                 parsed.html = _part_text(part)
                 continue
-        if not is_attachment and content_type.startswith(("image/", "application/")):
-            is_attachment = True
-            filename = filename or f"part-{part_id}.{content_type.partition('/')[2]}"
         if not is_attachment:
-            continue
+            # Anything that is not the body is an attachment, whatever its
+            # type: a text/csv or text/calendar part named only in its
+            # Content-Type would otherwise vanish, and be lost on a revision.
+            is_attachment = True
+            subtype = content_type.partition("/")[2] or "bin"
+            filename = filename or f"part-{part_id}.{subtype}"
 
         payload = part.get_payload(decode=True) or b""
         parsed.attachments.append(
