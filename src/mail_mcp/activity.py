@@ -1,0 +1,242 @@
+"""Activity log: what each agent did, through which connector and mailbox.
+
+Every MCP tool call is recorded as one JSON line: when, which connector, which
+mailbox, which tool, the arguments that are safe to keep, and how it ended.
+The web UI reads it back at ``/logs``.
+
+What is **not** recorded: message bodies, HTML, attachment payloads and any
+credential. Subjects, recipients, folders and UIDs are kept, because an
+activity log that cannot answer "what did it send, and to whom?" is not worth
+having. Values are truncated so one call cannot bloat the file.
+
+The file is append-only JSONL next to the store, trimmed to the most recent
+``MAIL_ACTIVITY_MAX_ENTRIES`` lines (default 5000, ``0`` disables logging).
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import time
+from contextvars import ContextVar
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from threading import Lock
+from typing import Any
+
+logger = logging.getLogger("mail-mcp.activity")
+
+DEFAULT_MAX_ENTRIES = 5000
+VALUE_LIMIT = 160
+
+# Arguments that would put message content or secrets on disk.
+_NEVER_LOG = frozenset(
+    {
+        "body",
+        "html",
+        "attachments",
+        "secret",
+        "password",
+        "content_base64",
+        "content",
+        "oauth_client_secret",
+    }
+)
+
+
+@dataclass
+class ActivityEntry:
+    """One tool call, as it is written to disk and shown in the UI."""
+
+    ts: float
+    tool: str
+    status: str = "ok"  # ok | error | denied
+    owner_id: str = ""
+    connection_id: str = ""
+    connection_label: str = ""
+    account: str = ""
+    arguments: dict[str, Any] = field(default_factory=dict)
+    detail: str = ""
+    duration_ms: int = 0
+
+    def to_json(self) -> str:
+        return json.dumps(asdict(self), ensure_ascii=False, default=str)
+
+    @classmethod
+    def from_json(cls, line: str) -> ActivityEntry | None:
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(payload, dict) or "tool" not in payload:
+            return None
+        known = {f for f in cls.__dataclass_fields__}
+        return cls(**{k: v for k, v in payload.items() if k in known})
+
+
+def redact(arguments: dict[str, Any] | None) -> dict[str, Any]:
+    """Keep the arguments worth auditing, drop content and secrets."""
+    safe: dict[str, Any] = {}
+    for name, value in (arguments or {}).items():
+        if name in _NEVER_LOG:
+            if value:
+                safe[name] = f"<{name} omitted>"
+            continue
+        if isinstance(value, str):
+            safe[name] = value[:VALUE_LIMIT] + ("..." if len(value) > VALUE_LIMIT else "")
+        elif isinstance(value, (int, float, bool)) or value is None:
+            safe[name] = value
+        elif isinstance(value, list):
+            safe[name] = [str(item)[:VALUE_LIMIT] for item in value[:20]]
+        else:
+            safe[name] = str(value)[:VALUE_LIMIT]
+    return safe
+
+
+# The entry being built for the call in flight, so the tools can name the
+# mailbox they resolved and the error they turned into text.
+_CURRENT: ContextVar[ActivityEntry | None] = ContextVar("mail_mcp_activity", default=None)
+
+
+def start(entry: ActivityEntry) -> None:
+    _CURRENT.set(entry)
+
+
+def current() -> ActivityEntry | None:
+    return _CURRENT.get()
+
+
+def note_account(address: str) -> None:
+    """Called once a tool knows which mailbox it is acting on."""
+    entry = _CURRENT.get()
+    if entry is not None and address:
+        entry.account = address
+
+
+def note_error(message: str, status: str = "error") -> None:
+    """Called when a tool returns a failure to the agent instead of raising.
+
+    ``status`` is ``denied`` when the gateway itself refused (a read-only
+    mailbox), ``error`` when the server or the network did.
+    """
+    entry = _CURRENT.get()
+    if entry is not None:
+        entry.status = status
+        entry.detail = message[:VALUE_LIMIT]
+
+
+class ActivityLog:
+    """Append-only JSONL log with a bounded number of entries."""
+
+    def __init__(self, path: str | None = None, max_entries: int | None = None):
+        self._path = Path(
+            path
+            or os.environ.get("MAIL_ACTIVITY_LOG", "")
+            or _default_path()
+        )
+        if max_entries is None:
+            try:
+                max_entries = int(
+                    os.environ.get("MAIL_ACTIVITY_MAX_ENTRIES", DEFAULT_MAX_ENTRIES)
+                )
+            except ValueError:
+                max_entries = DEFAULT_MAX_ENTRIES
+        self._max_entries = max(0, max_entries)
+        self._lock = Lock()
+        self._since_trim = 0
+
+    @property
+    def enabled(self) -> bool:
+        return self._max_entries > 0
+
+    @property
+    def path(self) -> Path:
+        return self._path
+
+    def append(self, entry: ActivityEntry) -> None:
+        """Write one entry. Never raises: logging must not break a tool call."""
+        if not self.enabled:
+            return
+        try:
+            with self._lock:
+                self._path.parent.mkdir(parents=True, exist_ok=True)
+                with self._path.open("a", encoding="utf-8") as handle:
+                    handle.write(entry.to_json() + "\n")
+                self._since_trim += 1
+                # Amortise trimming: check once every 10% of the budget.
+                if self._since_trim >= max(50, self._max_entries // 10):
+                    self._since_trim = 0
+                    self._trim_locked()
+        except OSError as e:
+            logger.warning("Could not write the activity log: %s", e)
+
+    def _trim_locked(self) -> None:
+        try:
+            lines = self._path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            return
+        if len(lines) <= self._max_entries:
+            return
+        kept = lines[-self._max_entries :]
+        tmp = self._path.with_suffix(".tmp")
+        tmp.write_text("\n".join(kept) + "\n", encoding="utf-8")
+        tmp.replace(self._path)
+        logger.info("Trimmed the activity log to the last %d entries", len(kept))
+
+    def read(
+        self,
+        *,
+        owner_id: str | None = None,
+        connection_id: str | None = None,
+        account: str | None = None,
+        tool: str | None = None,
+        status: str | None = None,
+        limit: int = 200,
+    ) -> list[ActivityEntry]:
+        """Most recent entries first, filtered. Unreadable lines are skipped."""
+        if not self._path.exists():
+            return []
+        try:
+            lines = self._path.read_text(encoding="utf-8").splitlines()
+        except OSError as e:
+            logger.warning("Could not read the activity log: %s", e)
+            return []
+
+        out: list[ActivityEntry] = []
+        for line in reversed(lines):
+            entry = ActivityEntry.from_json(line)
+            if entry is None:
+                continue
+            if owner_id is not None and entry.owner_id != owner_id:
+                continue
+            if connection_id and entry.connection_id != connection_id:
+                continue
+            if account and entry.account != account:
+                continue
+            if tool and entry.tool != tool:
+                continue
+            if status and entry.status != status:
+                continue
+            out.append(entry)
+            if len(out) >= max(1, limit):
+                break
+        return out
+
+    def stats(self, owner_id: str | None = None) -> dict[str, Any]:
+        """Counts for the header of the logs page."""
+        entries = self.read(owner_id=owner_id, limit=self._max_entries or 1)
+        day_ago = time.time() - 86400
+        return {
+            "total": len(entries),
+            "errors": sum(1 for e in entries if e.status != "ok"),
+            "last_24h": sum(1 for e in entries if e.ts >= day_ago),
+            "tools": sorted({e.tool for e in entries}),
+            "accounts": sorted({e.account for e in entries if e.account}),
+        }
+
+
+def _default_path() -> str:
+    """Sit next to the connection store, wherever that lives."""
+    store = os.environ.get("MAIL_STORE", "") or "/data/mail_connections.json"
+    return str(Path(store).with_name("mail_activity.jsonl"))

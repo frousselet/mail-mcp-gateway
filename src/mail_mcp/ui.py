@@ -50,6 +50,19 @@ _PAGE = """<!doctype html>
   th, td { text-align: left; padding: .45rem .3rem; border-bottom: 1px solid #8883;
            vertical-align: top; }
   details summary { cursor: pointer; margin-top: 1rem; font-weight: 600; }
+  .filters { display: flex; gap: .6rem; flex-wrap: wrap; align-items: flex-end; }
+  .filters label { margin-top: 0; font-size: .85rem; }
+  .filters select, .filters input { min-width: 9rem; }
+  .filters button { margin-top: 0; }
+  .pill { display: inline-block; padding: .1rem .45rem; border-radius: 999px;
+          font-size: .75rem; font-weight: 600; }
+  .pill.ok { background: #1e844933; color: #1e8449; }
+  .pill.error { background: #c0392b33; color: var(--danger); }
+  .pill.denied { background: #b9770e33; color: #b9770e; }
+  .logs td { font-size: .9rem; }
+  .logs .args { color: #888; font-size: .8rem; word-break: break-word; }
+  .stats { display: flex; gap: 1.5rem; flex-wrap: wrap; margin: .5rem 0 0; }
+  .stats b { font-size: 1.2rem; display: block; }
   @media (max-width: 640px) { .grid { grid-template-columns: 1fr; } }
 </style></head><body>
 {{body}}
@@ -269,7 +282,8 @@ def dashboard_page(
 
     return page(f"""
 <div class="top"><h1>Your MCP connectors</h1>
-  <span class="muted">{esc(email)} &middot; <a href="/logout">Sign out</a></span></div>
+  <span class="muted">{esc(email)} &middot; <a href="/logs">Activity log</a>
+    &middot; <a href="/logout">Sign out</a></span></div>
 {error_html}{notice_html}
 {connections_html}
 
@@ -387,4 +401,125 @@ and enter:</p>
 one from the dashboard). Authorized redirects: {redirects}.</p>
 <p><a href="/connections/{esc(connection['connection_id'])}">Add a mailbox to this
 connector</a> &middot; <a href="/">Back to your connectors</a></p>
+""")
+
+
+LOGS_JS = """
+<script>
+// Timestamps are rendered in UTC; show them in the reader's own timezone.
+for (const cell of document.querySelectorAll('[data-ts]')) {
+  const ms = Number(cell.getAttribute('data-ts')) * 1000;
+  if (!Number.isNaN(ms)) cell.textContent = new Date(ms).toLocaleString();
+}
+</script>
+"""
+
+
+def _select(name: str, options: list[tuple[str, str]], selected: str) -> str:
+    return (
+        f'<select name="{esc(name)}" onchange="this.form.submit()">'
+        + _option_list(options, selected)
+        + "</select>"
+    )
+
+
+def logs_page(
+    email: str,
+    entries: list[dict[str, Any]],
+    *,
+    connections: list[tuple[str, str]],
+    stats: dict[str, Any],
+    filters: dict[str, str],
+    limit: int,
+    truncated: bool = False,
+) -> str:
+    """The activity view: every MCP tool call this user's connectors served."""
+    tool_options = [("", "All tools")] + [(t, t) for t in stats.get("tools", [])]
+    account_options = [("", "All mailboxes")] + [
+        (a, a) for a in stats.get("accounts", [])
+    ]
+    connection_options = [("", "All connectors"), *connections]
+    status_options = [
+        ("", "Any outcome"),
+        ("ok", "Succeeded"),
+        ("error", "Failed"),
+        ("denied", "Refused (read-only)"),
+    ]
+
+    if entries:
+        rows = []
+        for entry in entries:
+            arguments = ", ".join(
+                f"{key}={value}" for key, value in (entry["arguments"] or {}).items()
+            )
+            detail = (
+                f'<div class="args">{esc(entry["detail"])}</div>'
+                if entry["detail"]
+                else ""
+            )
+            rows.append(
+                f"<tr>"
+                f'<td style="white-space:nowrap" data-ts="{esc(entry["ts"])}">'
+                f'{esc(entry["when"])}</td>'
+                f'<td><code>{esc(entry["tool"])}</code>'
+                + (f'<div class="args">{esc(arguments)}</div>' if arguments else "")
+                + detail
+                + "</td>"
+                f'<td>{esc(entry["account"] or "-")}<div class="args">'
+                f'{esc(entry["connection_label"] or entry["connection_id"])}</div></td>'
+                f'<td><span class="pill {esc(entry["status"])}">'
+                f'{esc(entry["status"])}</span></td>'
+                f'<td style="white-space:nowrap">{esc(entry["duration_ms"])} ms</td>'
+                f"</tr>"
+            )
+        table = (
+            '<table class="logs"><tr><th>When</th><th>Action</th>'
+            "<th>Mailbox</th><th>Outcome</th><th>Took</th></tr>"
+            + "".join(rows)
+            + "</table>"
+        )
+        note = (
+            f'<p class="muted">Showing the {len(entries)} most recent of the last '
+            f"{stats.get('total', 0)} recorded calls. Raise the limit to see more.</p>"
+            if truncated
+            else f'<p class="muted">{len(entries)} call(s).</p>'
+        )
+    else:
+        table = (
+            "<p class='muted'>Nothing recorded yet. Every tool call an agent makes "
+            "through your connectors shows up here.</p>"
+        )
+        note = ""
+
+    return page(f"""
+<div class="top"><h1>Activity log</h1>
+  <span class="muted">{esc(email)} &middot; <a href="/">Connectors</a>
+    &middot; <a href="/logout">Sign out</a></span></div>
+
+<div class="card">
+  <div class="stats">
+    <span><b>{esc(stats.get('total', 0))}</b> recorded calls</span>
+    <span><b>{esc(stats.get('last_24h', 0))}</b> in the last 24h</span>
+    <span><b>{esc(stats.get('errors', 0))}</b> failed or refused</span>
+  </div>
+</div>
+
+<form method="get" action="/logs" class="card filters">
+  <label>Connector<br>{_select("connection_id", connection_options,
+                               filters.get("connection_id", ""))}</label>
+  <label>Mailbox<br>{_select("account", account_options, filters.get("account", ""))}</label>
+  <label>Tool<br>{_select("tool", tool_options, filters.get("tool", ""))}</label>
+  <label>Outcome<br>{_select("status", status_options, filters.get("status", ""))}</label>
+  <label>Limit<br><input type="number" name="limit" value="{esc(limit)}" min="1"
+    max="1000" style="min-width:6rem"></label>
+  <button type="submit">Apply</button>
+  <a href="/logs"><button type="button" class="secondary">Reset</button></a>
+</form>
+
+{note}
+<div class="card">{table}</div>
+<p class="muted">Message bodies, attachments and credentials are never recorded.
+Subjects, recipients, folders and UIDs are, so the log can answer what was sent
+and to whom.</p>
+{LOGS_JS}
 """)

@@ -48,6 +48,24 @@ Outgoing mail is copied to the Sent folder, replies keep `In-Reply-To` and
 `References` so threads hold together, and a mailbox can be attached
 **read-only** so an agent can read it but never send, move or delete.
 
+## Activity log
+
+Every tool call an agent makes is recorded and shown at `/logs`: when it ran,
+which connector and mailbox it went through, which tool, the arguments worth
+auditing, whether it succeeded, was refused or failed, and how long it took.
+The view filters by connector, mailbox, tool and outcome, and each user only
+ever sees their own connectors.
+
+| Recorded                                              | Never recorded                      |
+| ----------------------------------------------------- | ----------------------------------- |
+| Subjects, recipients, folders, UIDs, flags, durations | Message bodies and HTML             |
+| Tool name, connector, mailbox, outcome, error text    | Attachment contents                 |
+| Timestamps                                            | Passwords, tokens, client secrets   |
+
+The log is a JSONL file next to the store, trimmed to the most recent 5000
+entries (`MAIL_ACTIVITY_MAX_ENTRIES`, `0` turns it off). The recording point is
+a server middleware, so a tool added later is covered without touching it.
+
 ## Quick start
 
 ```bash
@@ -125,6 +143,7 @@ and the `account` argument (or the connector's default) picks the one to act on.
 | Module              | Role                                                       |
 | ------------------- | ---------------------------------------------------------- |
 | `server.py`         | The MCP tools and how a request resolves to a mailbox      |
+| `activity.py`       | The activity log behind `/logs`, and what it redacts       |
 | `web.py`            | Onboarding UI, connector management, the ASGI app          |
 | `store.py`          | Encrypted store: users, connectors, mailboxes, OAuth state |
 | `oauth.py`          | OAuth 2.1 authorization server (PKCE, rotating refresh)    |
@@ -186,7 +205,7 @@ every variable.
 
 ```bash
 uv venv && uv pip install -e ".[dev]"
-uv run pytest        # 117 tests, including a fake IMAP server
+uv run pytest        # 135 tests, including a fake IMAP server
 uv run ruff check src tests
 ```
 

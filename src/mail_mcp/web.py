@@ -6,6 +6,7 @@ required:
 - ``/register`` / ``/login``      passwordless accounts (WebAuthn passkeys)
 - ``/``                           the signed-in user's connectors
 - ``/connections/new``            create a connector (one MCP connection)
+- ``/logs``                       every tool call the connectors served
 - ``/connections/{id}``           attach a mailbox to a connector
 - ``/discover`` / ``/test``       look up provider settings, probe IMAP+SMTP
 - ``/mcp``                        the shared, OAuth-protected MCP endpoint
@@ -24,6 +25,7 @@ import json as jsonlib
 import logging
 import os
 import secrets
+from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import urlparse
 
@@ -475,6 +477,72 @@ async def mailbox_default(request: Request) -> Response:
     if store and connection_id and account_id:
         await store.set_default_account(connection_id, account_id, owner_id=uid)
     return RedirectResponse("/", status_code=303)
+
+
+# ---------------------------------------------------------------------------
+# Activity log
+# ---------------------------------------------------------------------------
+
+
+def _entry_view(entry) -> dict[str, Any]:
+    when = datetime.fromtimestamp(entry.ts, tz=UTC)
+    return {
+        "ts": entry.ts,
+        "when": when.strftime("%Y-%m-%d %H:%M:%S UTC"),
+        "tool": entry.tool,
+        "status": entry.status if entry.status in ("ok", "error", "denied") else "error",
+        "account": entry.account,
+        "connection_id": entry.connection_id,
+        "connection_label": entry.connection_label,
+        "arguments": entry.arguments,
+        "detail": entry.detail,
+        "duration_ms": entry.duration_ms,
+    }
+
+
+@mcp.custom_route("/logs", methods=["GET"])
+async def logs(request: Request) -> Response:
+    """Everything the agents did, scoped to the signed-in user's connectors."""
+    uid = _uid(request)
+    if not uid:
+        return RedirectResponse("/login", status_code=303)
+
+    params = request.query_params
+    try:
+        limit = max(1, min(1000, int(params.get("limit", "100"))))
+    except ValueError:
+        limit = 100
+    filters = {
+        key: params.get(key, "").strip()
+        for key in ("connection_id", "account", "tool", "status")
+    }
+
+    log = server.ACTIVITY
+    entries = log.read(
+        owner_id=uid,
+        connection_id=filters["connection_id"] or None,
+        account=filters["account"] or None,
+        tool=filters["tool"] or None,
+        status=filters["status"] or None,
+        limit=limit,
+    )
+    stats = log.stats(owner_id=uid)
+    store = _store()
+    connections = [
+        (connection.connection_id, connection.label or connection.connection_id)
+        for connection in (store.list_connections(owner_id=uid) if store else [])
+    ]
+    return HTMLResponse(
+        ui.logs_page(
+            request.session.get("email", ""),
+            [_entry_view(entry) for entry in entries],
+            connections=connections,
+            stats=stats,
+            filters=filters,
+            limit=limit,
+            truncated=len(entries) >= limit and stats["total"] > len(entries),
+        )
+    )
 
 
 # ---------------------------------------------------------------------------

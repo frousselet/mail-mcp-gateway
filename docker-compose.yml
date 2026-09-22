@@ -25,6 +25,8 @@ services:
       MAIL_OAUTH_REDIRECT_URIS: ${MAIL_OAUTH_REDIRECT_URIS:-}
       MAIL_ALLOWED_HOSTS: ${MAIL_ALLOWED_HOSTS:-}
       MAIL_STORE: /data/mail_connections.json
+      MAIL_ACTIVITY_LOG: /data/mail_activity.jsonl
+      MAIL_ACTIVITY_MAX_ENTRIES: ${MAIL_ACTIVITY_MAX_ENTRIES:-5000}
       MAIL_LOG_LEVEL: ${MAIL_LOG_LEVEL:-INFO}
     ports:
       - "${MCP_PORT:-8000}:8000"

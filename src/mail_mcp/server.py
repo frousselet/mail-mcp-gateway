@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -24,8 +25,9 @@ from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions
 from mcp.server.mcpserver import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
 
-from mail_mcp import formatting, mutf7, smtp_client
+from mail_mcp import activity, formatting, mutf7, smtp_client
 from mail_mcp.accounts import AccountConfigError, AccountSet, MailAccount
+from mail_mcp.activity import ActivityEntry, ActivityLog
 from mail_mcp.composer import ComposeError, build_forward, build_message, build_reply
 from mail_mcp.imap_client import ImapClient, ImapError
 from mail_mcp.message import parse_headers, parse_message, truncate
@@ -153,9 +155,59 @@ _ENV_ACCOUNTS: AccountSet | None = None
 _ENV_CLIENTS: dict[str, ImapClient] = {}
 
 
+ACTIVITY = ActivityLog()
+
+
+def _identify(entry: ActivityEntry) -> None:
+    """Name the connector behind the call, so the log can be shown per user."""
+    if not _MULTITENANT:
+        entry.connection_id = "env"
+        entry.connection_label = "Single mailbox (environment)"
+        return
+    try:
+        token = get_access_token()
+    except Exception:
+        token = None
+    if token is None or STORE is None:
+        return
+    connection = STORE.get_connection_by_client_id(token.client_id)
+    if connection is not None:
+        entry.connection_id = connection.connection_id
+        entry.connection_label = connection.label
+        entry.owner_id = connection.owner_id
+
+
+async def _activity_middleware(ctx, call_next):
+    """Record every tool call: what ran, for whom, and how it ended."""
+    if ctx.method != "tools/call" or ctx.request_id is None or not ACTIVITY.enabled:
+        return await call_next(ctx)
+
+    params = ctx.params or {}
+    entry = ActivityEntry(
+        ts=time.time(),
+        tool=str(params.get("name") or "unknown"),
+        arguments=activity.redact(params.get("arguments")),
+    )
+    _identify(entry)
+    activity.start(entry)
+    started = time.perf_counter()
+    try:
+        return await call_next(ctx)
+    except Exception as e:
+        entry.status = "error"
+        entry.detail = f"{type(e).__name__}: {e}"
+        raise
+    finally:
+        entry.duration_ms = int((time.perf_counter() - started) * 1000)
+        ACTIVITY.append(entry)
+
+
 def _build_mcp() -> MCPServer:
     """Construct the MCP server, turning on OAuth in multi-user mode."""
-    kwargs: dict[str, Any] = {"instructions": INSTRUCTIONS}
+    kwargs: dict[str, Any] = {
+        "instructions": INSTRUCTIONS,
+        "middleware": [_activity_middleware],
+    }
     if _MULTITENANT:
         from mail_mcp.oauth import SCOPE, MailOAuthProvider
         from mail_mcp.store import ConnectionStore, MailboxRegistry
@@ -238,6 +290,7 @@ def _resolve(selector: str | None) -> tuple[MailAccount, ImapClient]:
     """Find the mailbox a call is about and its live IMAP client."""
     account_set = _current_account_set()
     account = account_set.resolve(selector)
+    activity.note_account(account.address)
     if _MULTITENANT and REGISTRY is not None:
         token = get_access_token()
         client = REGISTRY.imap_for(token.client_id if token else "", account)
@@ -250,22 +303,27 @@ def _resolve(selector: str | None) -> tuple[MailAccount, ImapClient]:
 
 
 def _handle(error: Exception) -> str:
-    """Turn an internal error into the text the agent sees."""
+    """Turn an internal error into the text the agent sees, and log it."""
     if isinstance(error, (ImapError, SmtpError)):
-        return f"Error: {error.message} {error.detail}".strip()
-    if isinstance(error, (AccountConfigError, ComposeError, SearchError, ToolError)):
-        return f"Error: {error}"
-    logger.exception("Unexpected failure in a tool call")
-    return f"Error: {type(error).__name__}: {error}"
+        message = f"Error: {error.message} {error.detail}".strip()
+    elif isinstance(error, (AccountConfigError, ComposeError, SearchError, ToolError)):
+        message = f"Error: {error}"
+    else:
+        logger.exception("Unexpected failure in a tool call")
+        message = f"Error: {type(error).__name__}: {error}"
+    activity.note_error(message, status=getattr(error, "activity_status", "error"))
+    return message
 
 
 def _ensure_writable(account: MailAccount, action: str) -> None:
     """Stop a read-only mailbox before anything is composed or sent."""
     if account.read_only:
-        raise ToolError(
+        error = ToolError(
             f"{account.address} is connected read-only, so {action} is not allowed. "
             "Change that in the web UI if you meant to."
         )
+        error.activity_status = "denied"
+        raise error
 
 
 def _uid_list(uids: list[int] | int | str) -> list[int]:
