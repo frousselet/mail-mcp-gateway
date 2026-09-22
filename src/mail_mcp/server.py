@@ -32,7 +32,14 @@ from mail_mcp.accounts import AccountConfigError, AccountSet, MailAccount
 from mail_mcp.activity import ActivityEntry, ActivityLog
 from mail_mcp.caldav_client import CalDavClient, CalDavError
 from mail_mcp.calendars import CalendarAccount, CalendarConfigError, CalendarSet
-from mail_mcp.composer import ComposeError, build_forward, build_message, build_reply
+from mail_mcp.composer import (
+    ComposeError,
+    build_forward,
+    build_message,
+    build_reply,
+    prepare_for_sending,
+    revise_draft,
+)
 from mail_mcp.events import (
     EventError,
     build_event,
@@ -69,15 +76,16 @@ INSTRUCTIONS = (
     "Mail, reading: `list_folders`, `list_messages`, `search_messages`, "
     "`get_message`, `get_thread`, `get_attachment`, `folder_status`.\n"
     "Mail, writing: `send_message`, `reply_message`, `forward_message`, "
-    "`save_draft`, `mark_messages`, `move_messages`, `delete_messages`, "
-    "`create_folder`.\n"
+    "`save_draft`, `update_draft`, `send_draft`, `mark_messages`, "
+    "`move_messages`, `delete_messages`, `create_folder`.\n"
     "Calendars, reading: `list_calendars`, `list_events`, `search_events`, "
     "`get_event`, `find_free_time`.\n"
     "Calendars, writing: `create_event`, `update_event`, `delete_event`, "
     "`respond_to_event`.\n\n"
     "Messages are identified by their IMAP UID **within a folder**, so pass the "
     "same `folder` you listed them from. UIDs are stable, but they are not "
-    "shared between folders: after a move, list again to get the new UID.\n\n"
+    "shared between folders: after a move, list again to get the new UID. "
+    "Editing a draft rewrites it, so `update_draft` returns a new UID too.\n\n"
     "Events are identified by their UID, which does not change. Times may be "
     "given as 2026-09-24T10:00, a plain date, \'today\', \'tomorrow\' or an "
     "offset such as \'+7d\'; a time written without an offset is read in the "
@@ -1047,6 +1055,8 @@ async def save_draft(
             bcc=bcc,
             html=html or "",
             attachments=attachments,
+            # A draft keeps its blind recipients; send_draft strips them.
+            bcc_header=True,
         )
         saved = await _save_copy(client, "drafts", outgoing.as_bytes(), "\\Draft")
         if not saved:
@@ -1060,6 +1070,147 @@ async def save_draft(
             to=to,
             message_id=outgoing.message_id,
         )
+    except Exception as e:
+        return _handle(e)
+
+
+async def _discard_message(client: ImapClient, folder: str, uid: int) -> str:
+    """Get a message out of a folder: to Trash when there is one, else expunge."""
+    trash = await client.folder_for_role("trash")
+    if trash:
+        raw_folder = await client.resolve_folder(folder)
+        if trash != raw_folder:
+            await client.move(folder, [uid], trash)
+            return "moved to Trash"
+    await client.store_flags(folder, [uid], ["\\Deleted"], add=True)
+    await client.expunge(folder, [uid])
+    return "deleted"
+
+
+@mcp.tool()
+async def update_draft(
+    uid: int,
+    folder: str = "drafts",
+    to: str | None = None,
+    subject: str | None = None,
+    body: str | None = None,
+    cc: str | None = None,
+    bcc: str | None = None,
+    html: str | None = None,
+    attachments: list[dict[str, Any]] | None = None,
+    account: str | None = None,
+) -> str:
+    """Revise an existing draft. Only the fields you pass change.
+
+    IMAP cannot edit a message in place, so this writes the revised draft and
+    then removes the old one (to Trash when the mailbox has one). The draft
+    gets a NEW UID, which is returned; use that one from now on.
+
+    Args:
+        uid: The UID of the draft to revise, as shown by list_messages.
+        folder: Where the draft lives (default: the Drafts folder).
+        to: Replacement recipient(s); omit to keep the current ones.
+        subject: Replacement subject; omit to keep it.
+        body: Replacement plain text body; omit to keep it.
+        cc: Replacement carbon-copy recipient(s); omit to keep them.
+        bcc: Replacement blind carbon-copy recipient(s); omit to keep them.
+        html: Replacement HTML alternative; omit to keep it.
+        attachments: Replacement attachments; omit to carry the current ones over.
+        account: Which mailbox to act on (address, label or id).
+    """
+    try:
+        mail_account, client = _resolve(account)
+        _ensure_writable(mail_account, "editing drafts")
+        original = parse_message(await client.fetch_raw(folder, uid))
+        revised = revise_draft(
+            mail_account,
+            original,
+            to=to,
+            subject=subject,
+            body=body,
+            cc=cc,
+            bcc=bcc,
+            html=html,
+            attachments=attachments,
+        )
+        target = await client.folder_for_role("drafts")
+        if not target:
+            return (
+                "Error: this mailbox has no Drafts folder I can write to. "
+                "Create one with create_folder first."
+            )
+        # Write the new version first: if removing the old one fails, the
+        # mailbox holds two drafts rather than none.
+        new_uid = await client.append(target, revised.as_bytes(), flags="\\Draft")
+        outcome = await _discard_message(client, folder, uid)
+        changed = [
+            name
+            for name, value in (
+                ("recipients", to),
+                ("subject", subject),
+                ("body", body),
+                ("cc", cc),
+                ("bcc", bcc),
+                ("html", html),
+                ("attachments", attachments),
+            )
+            if value is not None
+        ]
+        return formatting.format_action(
+            f"Revised the draft **{revised.message.get('Subject', '')}** "
+            f"({mail_account.address}).",
+            changed=", ".join(changed) or "nothing",
+            new_uid=new_uid if new_uid else "unknown (list the folder to find it)",
+            previous_draft=f"UID {uid}, {outcome}",
+            kept=(
+                f"{len(original.attachments)} attachment(s)"
+                if original.attachments and attachments is None
+                else ""
+            ),
+        )
+    except Exception as e:
+        return _handle(e)
+
+
+@mcp.tool()
+async def send_draft(
+    uid: int,
+    folder: str = "drafts",
+    save_to_sent: bool = True,
+    delete_draft: bool = True,
+    account: str | None = None,
+) -> str:
+    """Send a draft as it stands. This is irreversible: confirm it with the user.
+
+    The draft is sent exactly as written, with its Bcc recipients honoured but
+    stripped from the message, and its date refreshed.
+
+    Args:
+        uid: The UID of the draft to send.
+        folder: Where the draft lives (default: the Drafts folder).
+        save_to_sent: Also store a copy in the Sent folder (default true).
+        delete_draft: Remove the draft once it is sent (default true).
+        account: Which mailbox to send from (address, label or id).
+    """
+    try:
+        mail_account, client = _resolve(account)
+        _ensure_writable(mail_account, "sending")
+        original = parse_message(await client.fetch_raw(folder, uid))
+        payload, recipients = prepare_for_sending(original)
+        result = await smtp_client.send(mail_account, payload, recipients)
+        saved = ""
+        if save_to_sent:
+            saved = await _save_copy(client, "sent", payload, "\\Seen")
+        removed = ""
+        if delete_draft:
+            removed = await _discard_message(client, folder, uid)
+        return formatting.format_send_result(
+            result,
+            account=mail_account,
+            subject=original.subject,
+            saved_to=saved,
+            message_id=original.message_id,
+        ) + (f"\nThe draft was {removed}." if removed else "")
     except Exception as e:
         return _handle(e)
 

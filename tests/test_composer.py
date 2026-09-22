@@ -124,3 +124,79 @@ def test_forward_attaches_the_original(sender_account):
     assert "FYI" in parsed.body
     assert "Forwarded message" in parsed.body
     assert any(a.content_type == "message/rfc822" for a in parsed.attachments)
+
+
+def test_a_draft_remembers_its_blind_recipients(sender_account):
+    """Bcc must survive save_draft, or it is silently lost before sending."""
+    draft = build_message(
+        sender_account, to="bob@example.test", bcc="audit@example.test",
+        subject="x", body="y", bcc_header=True,
+    )
+    assert draft.message["Bcc"] == "audit@example.test"
+
+    # But a message on its way out must not carry them.
+    outgoing = build_message(
+        sender_account, to="bob@example.test", bcc="audit@example.test",
+        subject="x", body="y",
+    )
+    assert outgoing.message["Bcc"] is None
+    assert "audit@example.test" in outgoing.recipients
+
+
+def test_revise_draft_keeps_what_is_not_passed(sender_account):
+    from mail_mcp.composer import revise_draft
+
+    draft = build_message(
+        sender_account, to="bob@example.test", cc="carol@example.test",
+        subject="Devis", body="Premier jet",
+        attachments=[{"filename": "a.txt", "content_base64": "aGVsbG8="}],
+        bcc_header=True,
+    )
+    original = parse_message(draft.as_bytes())
+
+    revised = revise_draft(sender_account, original, body="Lorem ipsum")
+    parsed = parse_message(revised.as_bytes())
+    assert "Lorem ipsum" in parsed.body
+    assert parsed.subject == "Devis"
+    assert parsed.to == ["bob@example.test"]
+    assert parsed.cc == ["carol@example.test"]
+    assert [a.filename for a in parsed.attachments] == ["a.txt"]
+
+
+def test_revise_draft_can_drop_the_attachments(sender_account):
+    from mail_mcp.composer import revise_draft
+
+    draft = build_message(
+        sender_account, to="bob@example.test", subject="x", body="y",
+        attachments=[{"filename": "a.txt", "content_base64": "aGVsbG8="}],
+    )
+    revised = revise_draft(
+        sender_account, parse_message(draft.as_bytes()), attachments=[]
+    )
+    assert parse_message(revised.as_bytes()).attachments == []
+
+
+def test_prepare_for_sending_moves_bcc_to_the_envelope(sender_account):
+    from mail_mcp.composer import prepare_for_sending
+
+    draft = build_message(
+        sender_account, to="bob@example.test", cc="carol@example.test",
+        bcc="audit@example.test", subject="x", body="y", bcc_header=True,
+    )
+    payload, recipients = prepare_for_sending(parse_message(draft.as_bytes()))
+    assert set(recipients) == {"bob@example.test", "carol@example.test", "audit@example.test"}
+    assert b"audit@example.test" not in payload.replace(b"\r\n ", b"")
+    assert b"Date:" in payload
+
+
+def test_prepare_for_sending_refuses_a_draft_with_nobody_to_send_to(sender_account):
+    from email.message import EmailMessage
+
+    from mail_mcp.composer import prepare_for_sending
+
+    orphan = EmailMessage()
+    orphan["Subject"] = "Notes to self"
+    orphan["From"] = sender_account.address
+    orphan.set_content("...")
+    with pytest.raises(ComposeError, match="nobody to send it to"):
+        prepare_for_sending(parse_message(orphan.as_bytes()))

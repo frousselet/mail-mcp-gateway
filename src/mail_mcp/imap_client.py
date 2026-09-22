@@ -39,6 +39,7 @@ _UID_RE = re.compile(rb"UID\s+(\d+)")
 _FLAGS_RE = re.compile(rb"FLAGS\s+\(([^)]*)\)")
 _SIZE_RE = re.compile(rb"RFC822\.SIZE\s+(\d+)")
 _INTERNALDATE_RE = re.compile(rb'INTERNALDATE\s+"([^"]+)"')
+_APPENDUID_RE = re.compile(rb"APPENDUID\s+\d+\s+(\d+)")
 
 # Special-use attributes (RFC 6154) mapped to the role the gateway needs.
 _SPECIAL_USE = {
@@ -589,7 +590,13 @@ class ImapClient:
         *,
         flags: str = "",
         when: datetime | None = None,
-    ) -> None:
+    ) -> int | None:
+        """Store a message in a folder; returns its new UID when the server says.
+
+        A server with UIDPLUS answers ``OK [APPENDUID <validity> <uid>]``, which
+        is the only way to name the message that was just written. Without it
+        the caller gets ``None`` and has to search for it.
+        """
         self._guard_read_only("saving messages")
         raw = await self.resolve_folder(folder)
         stamp = imaplib.Time2Internaldate(when.timestamp() if when else time.time())
@@ -603,6 +610,10 @@ class ImapClient:
                 f"Could not save the message to {mutf7.decode(raw)!r}.",
                 detail=_first(data),
             )
+        # The folder gained a message, so any cached selection is stale.
+        self._selected = None
+        match = _APPENDUID_RE.search(_first(data).encode())
+        return int(match.group(1)) if match else None
 
 
 def _first(data: Any) -> str:

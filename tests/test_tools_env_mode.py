@@ -206,3 +206,118 @@ def test_env_configuration_builds_an_account(monkeypatch, tmp_path):
     assert addresses == ["second@example.test", "ada@example.test"]
     assert account_set.resolve("ada@example.test").read_only is True
     assert account_set.resolve("second@example.test").secret == "pw2"
+
+
+# ---------------------------------------------------------------------------
+# Drafts: revising one, and sending it
+# ---------------------------------------------------------------------------
+
+
+async def _make_draft(tools, imap_server, **overrides):
+    """Save a draft and return its UID in the Drafts folder."""
+    payload = dict(to="bob@example.test", subject="Test", body="Premier jet")
+    payload.update(overrides)
+    await tools.save_draft(**payload)
+    drafts = imap_server.state.folders["Drafts"]
+    return max(drafts.messages), drafts
+
+
+async def test_update_draft_changes_only_what_is_passed(tools, imap_server):
+    uid, drafts = await _make_draft(tools, imap_server)
+
+    out = await tools.update_draft(uid=uid, body="Lorem ipsum dolor sit amet")
+    assert "Revised the draft" in out
+    assert "changed: body" in out.lower()
+
+    # Exactly one draft remains, and it is the revised one.
+    assert len(drafts.messages) == 1
+    raw = next(iter(drafts.messages.values()))[0]
+    assert b"Lorem ipsum" in raw
+    assert b"Premier jet" not in raw
+    # The untouched fields survived.
+    assert b"bob@example.test" in raw.replace(b"\r\n ", b"")
+    assert b"Test" in raw
+
+
+async def test_update_draft_reports_the_new_uid(tools, imap_server):
+    uid, drafts = await _make_draft(tools, imap_server)
+    out = await tools.update_draft(uid=uid, subject="Test (révisé)")
+    new_uid = max(drafts.messages)
+    assert f"New uid: {new_uid}" in out
+    assert new_uid != uid
+    assert f"UID {uid}" in out  # says what became of the old one
+
+
+async def test_update_draft_puts_the_old_one_in_the_trash(tools, imap_server):
+    uid, _ = await _make_draft(tools, imap_server)
+    out = await tools.update_draft(uid=uid, body="v2")
+    assert "moved to Trash" in out
+    assert len(imap_server.state.folders["Trash"].messages) == 1
+
+
+async def test_update_draft_carries_attachments_over(tools, imap_server):
+    import base64
+
+    payload = base64.b64encode(b"col1,col2\n1,2\n").decode()
+    uid, drafts = await _make_draft(
+        tools,
+        imap_server,
+        attachments=[{"filename": "data.csv", "content_base64": payload}],
+    )
+    out = await tools.update_draft(uid=uid, body="Avec la pièce jointe")
+    assert "1 attachment(s)" in out
+    raw = next(iter(drafts.messages.values()))[0].replace(b"\r\n ", b"")
+    assert b"data.csv" in raw
+    assert b"col1,col2" in base64.b64decode(
+        raw.split(b"base64")[-1].split(b"--")[0].strip().replace(b"\r\n", b"")
+    )
+
+
+async def test_update_draft_can_replace_recipients(tools, imap_server):
+    uid, drafts = await _make_draft(tools, imap_server)
+    await tools.update_draft(uid=uid, to="carol@example.test")
+    raw = next(iter(drafts.messages.values()))[0].replace(b"\r\n ", b"")
+    assert b"carol@example.test" in raw
+    assert b"bob@example.test" not in raw
+
+
+async def test_update_draft_on_a_missing_message_is_explained(tools):
+    out = await tools.update_draft(uid=9999, body="x")
+    assert out.startswith("Error:")
+    assert "was not found" in out
+
+
+async def test_send_draft(tools, imap_server, sent_messages):
+    uid, drafts = await _make_draft(tools, imap_server, body="Prêt à partir")
+
+    out = await tools.send_draft(uid=uid)
+    assert "Sent **Test**" in out
+    assert sent_messages[0]["recipients"] == ["bob@example.test"]
+    assert b"Pr" in sent_messages[0]["raw"]
+    assert "A copy was saved to Sent." in out
+    assert "The draft was moved to Trash." in out
+    assert drafts.messages == {}
+
+
+async def test_send_draft_strips_bcc_from_the_message(tools, imap_server, sent_messages):
+    uid, _ = await _make_draft(tools, imap_server, bcc="audit@example.test")
+
+    await tools.send_draft(uid=uid)
+    envelope = sent_messages[0]["recipients"]
+    assert "audit@example.test" in envelope  # blind copy still receives it
+    assert b"audit@example.test" not in sent_messages[0]["raw"].replace(b"\r\n ", b"")
+
+
+async def test_send_draft_can_keep_the_draft(tools, imap_server, sent_messages):
+    uid, drafts = await _make_draft(tools, imap_server)
+    out = await tools.send_draft(uid=uid, delete_draft=False, save_to_sent=False)
+    assert "The draft was" not in out
+    assert uid in drafts.messages
+
+
+async def test_read_only_mailbox_refuses_both_draft_tools(tools, account, sent_messages, imap_server):
+    uid, _ = await _make_draft(tools, imap_server)
+    account.read_only = True
+    assert "read-only" in await tools.update_draft(uid=uid, body="x")
+    assert "read-only" in await tools.send_draft(uid=uid)
+    assert sent_messages == []

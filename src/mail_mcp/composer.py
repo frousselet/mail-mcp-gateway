@@ -7,6 +7,7 @@ import binascii
 import mimetypes
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from email import message_from_bytes, policy
 from email.message import EmailMessage
 from email.utils import format_datetime, make_msgid, parseaddr
 from typing import Any
@@ -99,8 +100,15 @@ def build_message(
     reply_to: str | list[str] | None = None,
     attachments: list[dict[str, Any]] | None = None,
     headers: dict[str, str] | None = None,
+    bcc_header: bool = False,
 ) -> OutgoingMessage:
-    """Build a message ready to hand to SMTP or to APPEND as a draft."""
+    """Build a message ready to hand to SMTP or to APPEND as a draft.
+
+    ``bcc_header`` writes the blind recipients into the message itself. That is
+    wrong for something about to be sent, since a Bcc carried in the headers is
+    not blind, and right for a draft, which is how mail clients remember them
+    until the message goes out.
+    """
     to_list = _split_addresses(to)
     cc_list = _split_addresses(cc)
     bcc_list = _split_addresses(bcc)
@@ -113,6 +121,8 @@ def build_message(
         message["To"] = ", ".join(to_list)
     if cc_list:
         message["Cc"] = ", ".join(cc_list)
+    if bcc_list and bcc_header:
+        message["Bcc"] = ", ".join(bcc_list)
     message["Subject"] = subject or "(no subject)"
     message["Date"] = format_datetime(datetime.now(UTC))
     domain = account.address.rpartition("@")[2] or "localhost"
@@ -238,3 +248,94 @@ def build_forward(
             filename=f"{(original.subject or 'message')[:60]}.eml",
         )
     return outgoing
+
+
+# ---------------------------------------------------------------------------
+# Drafts
+# ---------------------------------------------------------------------------
+
+
+def carried_attachments(original: ParsedMessage) -> list[dict[str, Any]]:
+    """Re-encode an existing message's attachments so they can be re-attached.
+
+    IMAP cannot edit a message in place: revising a draft means writing a new
+    one, and its attachments have to travel across by hand or they are lost.
+    """
+    carried: list[dict[str, Any]] = []
+    for attachment in original.attachments:
+        part = original.attachment_part(attachment.part_id)
+        if part is None:
+            continue
+        payload = part.get_payload(decode=True) or b""
+        if not payload:
+            continue
+        carried.append(
+            {
+                "filename": attachment.filename,
+                "content_base64": base64.b64encode(payload).decode(),
+                "content_type": attachment.content_type,
+            }
+        )
+    return carried
+
+
+def revise_draft(
+    account: MailAccount,
+    original: ParsedMessage,
+    *,
+    to: str | list[str] | None = None,
+    subject: str | None = None,
+    body: str | None = None,
+    cc: str | list[str] | None = None,
+    bcc: str | list[str] | None = None,
+    html: str | None = None,
+    attachments: list[dict[str, Any]] | None = None,
+    keep_attachments: bool = True,
+) -> OutgoingMessage:
+    """Build the revised version of a draft: only the given fields change.
+
+    Everything not passed is carried over from the draft as it stands, so
+    "change the subject" does not quietly drop the recipients or the files.
+    """
+    files = attachments
+    if files is None and keep_attachments:
+        files = carried_attachments(original)
+
+    return build_message(
+        account,
+        to=to if to is not None else list(original.to),
+        cc=cc if cc is not None else list(original.cc),
+        bcc=bcc if bcc is not None else list(original.bcc),
+        subject=subject if subject is not None else original.subject,
+        body=body if body is not None else original.body,
+        html=html if html is not None else original.html,
+        attachments=files,
+        headers={
+            "In-Reply-To": original.in_reply_to,
+            "References": " ".join(original.references),
+        },
+        bcc_header=True,
+    )
+
+
+def prepare_for_sending(original: ParsedMessage) -> tuple[bytes, list[str]]:
+    """Turn a stored draft into what SMTP needs: the wire bytes and envelope.
+
+    ``Bcc`` is read to build the envelope and then stripped from the message,
+    because a blind copy that travels in the headers is not blind. ``Date`` is
+    refreshed: the draft may have been written days ago.
+    """
+    message = message_from_bytes(original.raw, policy=policy.default)
+    recipients = [
+        _bare(address)
+        for header in ("To", "Cc", "Bcc")
+        for address in _split_addresses(message.get(header, ""))
+    ]
+    recipients = [address for address in recipients if address]
+    if not recipients:
+        raise ComposeError("That draft has no recipient, so there is nobody to send it to.")
+
+    del message["Bcc"]
+    del message["Date"]
+    message["Date"] = format_datetime(datetime.now(UTC))
+    return message.as_bytes(), recipients
