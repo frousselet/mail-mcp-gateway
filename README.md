@@ -112,6 +112,18 @@ ever sees their own connectors.
 | Tool name, connector, mailbox, outcome, error text    | Attachment contents                 |
 | Timestamps                                            | Passwords, tokens, client secrets   |
 
+The page leads with three figures, then plots calls per day over a fortnight
+with failures stacked on top, and the tools the agents actually reach for. Each
+connector on the dashboard carries its own sparkline and when it was last used,
+so a dormant or misbehaving one is visible without opening anything.
+
+The charts are server-rendered HTML, not a charting library: no script runs, the
+strict CSP holds, and the labels keep their size on a phone instead of shrinking
+with the picture. Magnitudes ride on generated utility classes because
+`style-src 'self'` forbids inline styles. Every chart names its series in words,
+carries a description for screen readers, and is followed by the same numbers as
+a table.
+
 The log is a JSONL file next to the store, trimmed to the most recent 5000
 entries (`MAIL_ACTIVITY_MAX_ENTRIES`, `0` turns it off). The recording point is
 a server middleware, so a tool added later is covered without touching it.
@@ -288,7 +300,7 @@ every variable.
 
 ```bash
 uv venv && uv pip install -e ".[dev]"
-uv run pytest        # 255 tests, including fake IMAP and CalDAV servers
+uv run pytest        # 282 tests, including fake IMAP and CalDAV servers
 uv run ruff check src tests
 ```
 

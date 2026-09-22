@@ -149,6 +149,7 @@ def _connection_view(
             "last_used": activity.humanise_age(summary.get("last_ts", 0), time.time()),
             "calls_7d": summary.get("calls_7d", 0),
             "errors_7d": summary.get("errors_7d", 0),
+            "series": summary.get("series", []),
         },
         "connection_id": connection.connection_id,
         "client_id": connection.client_id,
@@ -199,7 +200,8 @@ def _dashboard(request: Request, error: str = "", notice: str = "") -> HTMLRespo
     store = _store()
     uid = _uid(request) or ""
     base_url = _base_url(request)
-    summary = activity.summarise_by_connection(server.ACTIVITY, uid) if uid else {}
+    overview = activity.overview(server.ACTIVITY, uid) if uid else None
+    summary = overview.by_connection if overview else {}
     email = request.session.get("email", "")
     connections = [
         _connection_view(connection, base_url, activity_summary=summary, email=email)
@@ -975,6 +977,7 @@ async def logs(request: Request) -> Response:
     }
 
     log = server.ACTIVITY
+    overview = activity.overview(log, uid)
     entries = log.read(
         owner_id=uid,
         connection_id=filters["connection_id"] or None,
@@ -999,6 +1002,7 @@ async def logs(request: Request) -> Response:
             limit=limit,
             truncated=len(entries) >= limit and stats["total"] > len(entries),
             filtered=any(filters.values()),
+            overview=overview,
         )
     )
 

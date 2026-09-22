@@ -133,3 +133,62 @@ def test_a_broken_log_never_breaks_a_call(tmp_path):
     log = ActivityLog(str(path), max_entries=10)
     log.append(_entry())  # must not raise
     assert log.read() == []
+
+
+# ---------------------------------------------------------------------------
+# The aggregation behind the dashboard charts
+# ---------------------------------------------------------------------------
+
+
+def test_overview_buckets_by_day_and_ranks_tools(log):
+    from mail_mcp.activity import overview
+
+    now = time.time()
+    for offset, tool, status in (
+        (0, "search_messages", "ok"),
+        (0, "search_messages", "ok"),
+        (0, "send_message", "error"),
+        (86400, "search_messages", "ok"),
+        (86400 * 3, "get_message", "denied"),
+    ):
+        log.append(_entry(tool=tool, status=status, ts=now - offset))
+
+    result = overview(log, "usr_1", days=14, now=now)
+    assert result.total == 5
+    assert result.failed == 2
+    assert [day["ok"] for day in result.days][-1] == 2
+    assert [day["failed"] for day in result.days][-1] == 1
+    assert result.tools[0] == ("search_messages", 3)
+    assert len(result.days) == 14
+    assert result.accounts == ["ada@example.test"]
+
+
+def test_overview_gives_each_connector_its_own_series(log):
+    from mail_mcp.activity import overview
+
+    now = time.time()
+    log.append(_entry(connection_id="con_a", ts=now))
+    log.append(_entry(connection_id="con_a", ts=now - 86400))
+    log.append(_entry(connection_id="con_b", ts=now))
+
+    result = overview(log, "usr_1", days=7, now=now)
+    assert sum(result.by_connection["con_a"]["series"]) == 2
+    assert sum(result.by_connection["con_b"]["series"]) == 1
+    assert len(result.by_connection["con_a"]["series"]) == 7
+
+
+def test_overview_ignores_entries_older_than_the_window_in_the_series(log):
+    from mail_mcp.activity import overview
+
+    now = time.time()
+    log.append(_entry(ts=now - 86400 * 40))
+    result = overview(log, "usr_1", days=14, now=now)
+    assert result.total == 1  # still counted overall
+    assert sum(day["ok"] + day["failed"] for day in result.days) == 0  # not plotted
+
+
+def test_overview_of_another_owner_is_empty(log):
+    from mail_mcp.activity import overview
+
+    log.append(_entry())
+    assert overview(log, "usr_other", days=7).total == 0

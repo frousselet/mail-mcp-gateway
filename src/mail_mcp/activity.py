@@ -242,6 +242,83 @@ def _default_path() -> str:
     return str(Path(store).with_name("mail_activity.jsonl"))
 
 
+@dataclass
+class Overview:
+    """Everything the dashboard and the activity page plot, from one read.
+
+    The log is a file: reading it once and deriving every figure keeps a busy
+    page from re-reading it five times.
+    """
+
+    days: list[dict[str, Any]] = field(default_factory=list)
+    tools: list[tuple[str, int]] = field(default_factory=list)
+    by_connection: dict[str, dict[str, Any]] = field(default_factory=dict)
+    total: int = 0
+    failed: int = 0
+    last_24h: int = 0
+    accounts: list[str] = field(default_factory=list)
+
+
+def overview(
+    log: ActivityLog, owner_id: str, *, days: int = 14, now: float | None = None
+) -> Overview:
+    """Aggregate this owner's activity over the last ``days`` days."""
+    import datetime as _dt
+
+    moment = now if now is not None else time.time()
+    today = _dt.datetime.fromtimestamp(moment).date()
+    span = [today - _dt.timedelta(days=offset) for offset in range(days - 1, -1, -1)]
+    index = {day: position for position, day in enumerate(span)}
+
+    buckets = [
+        {"date": day, "label": day.strftime("%d"), "full": day.isoformat(), "ok": 0, "failed": 0}
+        for day in span
+    ]
+    tools: dict[str, int] = {}
+    per_connection: dict[str, dict[str, Any]] = {}
+    accounts: set[str] = set()
+    total = failed = last_24h = 0
+    day_ago = moment - 86400
+
+    for entry in log.read(owner_id=owner_id, limit=log._max_entries or 1):
+        total += 1
+        succeeded = entry.status == "ok"
+        if not succeeded:
+            failed += 1
+        if entry.ts >= day_ago:
+            last_24h += 1
+        if entry.account:
+            accounts.add(entry.account)
+        tools[entry.tool] = tools.get(entry.tool, 0) + 1
+
+        bucket = per_connection.setdefault(
+            entry.connection_id,
+            {"last_ts": 0.0, "calls_7d": 0, "errors_7d": 0, "series": [0] * days},
+        )
+        bucket["last_ts"] = max(bucket["last_ts"], entry.ts)
+
+        position = index.get(_dt.datetime.fromtimestamp(entry.ts).date())
+        if position is None:
+            continue
+        buckets[position]["ok" if succeeded else "failed"] += 1
+        bucket["series"][position] += 1
+        if entry.ts >= moment - 7 * 86400:
+            bucket["calls_7d"] += 1
+            if not succeeded:
+                bucket["errors_7d"] += 1
+
+    ranked = sorted(tools.items(), key=lambda item: (-item[1], item[0]))
+    return Overview(
+        days=buckets,
+        tools=ranked,
+        by_connection=per_connection,
+        total=total,
+        failed=failed,
+        last_24h=last_24h,
+        accounts=sorted(accounts),
+    )
+
+
 def summarise_by_connection(log: ActivityLog, owner_id: str) -> dict[str, dict[str, Any]]:
     """Per-connector activity for the dashboard: last use, recent volume, errors.
 

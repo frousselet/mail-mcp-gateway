@@ -38,6 +38,9 @@ APP_CSS = """
   --tint-ok: #136b3a1a; --tint-danger: #b322181a; --tint-warn: #8a53001a;
   --tint-accent: #1f5fd014;
   --focus: #1f5fd0; --shadow: 0 1px 2px rgb(16 24 40 / .06);
+  /* Chart marks, validated against the light surface: CVD separation 28.4,
+     both inside the lightness band, both over 3:1. */
+  --chart-1: #1f5fd0; --chart-alert: #b32218;
 }
 @media (prefers-color-scheme: dark) {
   :root {
@@ -50,6 +53,9 @@ APP_CSS = """
     --tint-ok: #5cd08c26; --tint-danger: #ff8d8026; --tint-warn: #e6ab4826;
     --tint-accent: #6fa0f526;
     --focus: #8ab4f8; --shadow: none;
+    /* Dark is selected, not flipped: these are the steps that pass the same
+       six checks against #181b21 (separation 20.7, band, contrast). */
+    --chart-1: #5590ea; --chart-alert: #e06a5e;
   }
 }
 
@@ -114,7 +120,7 @@ button:hover, .btn:hover { background: var(--accent-hover); color: var(--accent-
 .danger { background: var(--surface); color: var(--danger); border-color: var(--danger); }
 .danger:hover { background: var(--tint-danger); color: var(--danger); }
 button:disabled, .btn[aria-disabled="true"] { opacity: .55; cursor: not-allowed; }
-.small { min-height: 36px; padding: .4rem .7rem; font-size: var(--fs-sm); }
+.small { min-height: 36px; padding: .4rem .7rem; font-size: var(--fs-sm); white-space: nowrap; }
 @media (pointer: coarse) { button.small, .btn.small { min-height: 44px; padding-inline: .9rem; } }
 .actions { display: flex; flex-wrap: wrap; gap: var(--s2); align-items: center; }
 .actions form { margin: 0; }
@@ -198,6 +204,70 @@ tbody tr:last-child td { border-bottom: 0; }
   .stack tbody tr { display: block; border-bottom: 1px solid var(--border); padding: var(--s2) 0; }
   .stack tbody td { display: block; border: 0; padding: var(--s1) 0; }
   .stack tbody td .label { display: inline; color: var(--muted); font-size: var(--fs-sm); margin-right: var(--s2); }
+}
+
+/* --------------------------------------------------------------- charts */
+.chart { margin: 0 0 var(--s5); }
+.chart:last-child { margin-bottom: 0; }
+.chart figcaption { font-weight: 600; margin-bottom: var(--s1); }
+.legend { display: flex; flex-wrap: wrap; gap: var(--s4); align-items: center;
+          color: var(--muted); font-size: var(--fs-sm); margin: 0 0 var(--s3); }
+.key { width: 10px; height: 10px; border-radius: 2px; display: inline-block;
+       margin-right: .4rem; vertical-align: -1px; }
+.key-ok { background: var(--chart-1); }
+.key-alert { background: var(--chart-alert); }
+
+/* Columns: a stack per day, magnitudes carried by the vN classes below. */
+.plot { display: grid; grid-template-columns: auto 1fr; grid-template-rows: 160px auto;
+         column-gap: var(--s2); }
+.scale { grid-row: 1; display: flex; flex-direction: column; justify-content: space-between;
+         color: var(--muted); font-size: var(--fs-xs); text-align: right;
+         font-variant-numeric: tabular-nums; }
+.cols { grid-row: 1; grid-column: 2; display: flex; align-items: flex-end; gap: 2px;
+        border-bottom: 1px solid var(--border-strong);
+        background-image: linear-gradient(var(--border), var(--border));
+        background-size: 100% 1px; background-position: 0 50%;
+        background-repeat: no-repeat; }
+.slot { position: relative; flex: 1; height: 100%; display: flex;
+        align-items: flex-end; justify-content: center; }
+.col { position: relative; display: flex; flex-direction: column; justify-content: flex-end;
+       width: 100%; max-width: 22px; }  /* height comes from its own vN class */
+.seg { display: block; width: 100%; }
+.seg-ok { background: var(--chart-1); }
+.seg-alert { background: var(--chart-alert); border-radius: 4px 4px 0 0; }
+.seg.capped { border-radius: 4px 4px 0 0; }
+.seg.gapped { margin-bottom: 2px; }  /* surface, not a stroke, does the separating */
+.col-value { position: absolute; bottom: 100%; left: 50%; transform: translateX(-50%);
+             margin-bottom: var(--s1); color: var(--muted);
+             font-size: var(--fs-xs); font-weight: 600; }
+.axis { grid-row: 2; grid-column: 2; display: flex; gap: 2px; margin-top: var(--s1);
+        color: var(--muted); font-size: var(--fs-xs); }
+.axis .tick { flex: 1; text-align: center; font-variant-numeric: tabular-nums; }
+
+/* Horizontal bars: label, track, value. */
+.bars { display: grid; gap: var(--s2); }
+.bar-row { display: grid; grid-template-columns: minmax(6rem, 11rem) 1fr 3ch;
+           gap: var(--s3); align-items: center; }
+.bar-label { color: var(--text); font-size: var(--fs-sm); text-align: right;
+             overflow-wrap: anywhere; }
+.bar-track { display: block; height: 18px; }
+.bar { display: block; height: 100%; background: var(--chart-1);
+       border-radius: 0 4px 4px 0; }
+.bar-value { color: var(--muted); font-size: var(--fs-sm); font-weight: 600;
+             font-variant-numeric: tabular-nums; }
+@media (max-width: 34rem) {
+  .bar-row { grid-template-columns: 1fr 3ch; }
+  .bar-label { grid-column: 1 / -1; text-align: left; }
+}
+
+.c-ok { fill: var(--chart-1); }
+.c-spark { width: 110px; height: 22px; vertical-align: middle; margin-right: var(--s2); }
+.chart-data { border: 0; padding: 0; margin-top: var(--s3); }
+.chart-data summary { font-weight: 400; font-size: var(--fs-sm); color: var(--muted); }
+.charts { display: grid; gap: var(--s6); }
+@media (forced-colors: active) {
+  .seg-ok, .bar, .c-ok { background: CanvasText; fill: CanvasText; }
+  .seg-alert { background: Highlight; }
 }
 
 /* ----------------------------------------------------------------- misc */
@@ -533,6 +603,20 @@ document.addEventListener('DOMContentLoaded', function () {
   }
 });
 """
+
+
+def _size_classes() -> str:
+    """``v0``-``v100`` and ``w0``-``w100``: height and width in whole percent.
+
+    Generated rather than written out: a chart has to express a magnitude, and
+    with `style-src 'self'` an inline ``style`` attribute is not available.
+    """
+    heights = "".join(f".v{n}{{height:{n}%}}" for n in range(101))
+    widths = "".join(f".w{n}{{width:{n}%}}" for n in range(101))
+    return f"\n/* generated magnitude classes */\n{heights}\n{widths}\n"
+
+
+APP_CSS += _size_classes()
 
 
 def _fingerprint(content: str) -> str:

@@ -20,6 +20,7 @@ from __future__ import annotations
 import html
 from typing import Any
 
+from mail_mcp import charts
 from mail_mcp.assets import CSS_VERSION, JS_VERSION
 
 PRODUCT = "Mail MCP Gateway"
@@ -291,7 +292,7 @@ def _mailbox_rows(connection: dict[str, Any]) -> str:
             else (
                 '<form method="post" action="/mailboxes/default">'
                 f'{_hidden({"connection_id": connection["connection_id"], "account_id": box["account_id"]})}'
-                '<button class="small secondary" data-busy="Setting">Make default</button></form>'
+                '<button class="small secondary" data-busy="Setting">Set as default</button></form>'
             )
         )
         rows.append(
@@ -352,12 +353,22 @@ def _connector_card(connection: dict[str, Any]) -> str:
         used = f'<span class="muted small-text">Last used {esc(activity["last_used"])}</span>'
     else:
         used = _badge("Never used", "idle")
+    series = activity.get("series") or []
+    spark = charts.sparkline(
+        series,
+        label=(
+            f"{sum(series)} calls over the last {len(series)} days, "
+            f"{activity.get('errors_7d', 0)} of them failed or refused this week"
+        ),
+    )
 
     counts = []
-    if connection["accounts"]:
-        counts.append(f"{len(connection['accounts'])} mailbox(es)")
-    if connection.get("calendars"):
-        counts.append(f"{len(connection['calendars'])} calendar(s)")
+    mailboxes = len(connection["accounts"])
+    calendars = len(connection.get("calendars", []))
+    if mailboxes:
+        counts.append(f"{mailboxes} mailbox" + ("es" if mailboxes > 1 else ""))
+    if calendars:
+        counts.append(f"{calendars} calendar" + ("s" if calendars > 1 else ""))
     summary = ", ".join(counts) or "nothing attached yet"
 
     unfinished = (
@@ -374,7 +385,7 @@ def _connector_card(connection: dict[str, Any]) -> str:
 <section class="card" aria-labelledby="c-{esc(connection['connection_id'])}">
   <div class="card-head">
     <h2 id="c-{esc(connection['connection_id'])}">{esc(connection['label'] or 'Connector')}</h2>
-    <span class="muted small-text">{esc(summary)} &middot; {used}</span>
+    <span class="muted small-text">{spark} {esc(summary)} &middot; {used}</span>
   </div>
   {unfinished}
   {_mailbox_rows(connection)}
@@ -757,6 +768,7 @@ def logs_page(
     limit: int,
     truncated: bool = False,
     filtered: bool = False,
+    overview: Any = None,
 ) -> str:
     """Every tool call the agents made, scoped to this user's connectors."""
     tool_options = [("", "All tools")] + [(t, t) for t in stats.get("tools", [])]
@@ -834,6 +846,21 @@ def logs_page(
         )
         note = ""
 
+    if overview is not None and overview.total:
+        days = [
+            charts.DayPoint(
+                label=day["label"], full=day["full"], ok=day["ok"], failed=day["failed"]
+            )
+            for day in overview.days
+        ]
+        plots = f"""
+<div class="card charts">
+  {charts.daily_activity_chart(days, title=f"Calls per day, last {len(days)} days")}
+  {charts.tool_usage_chart(overview.tools[:6], title="Most used tools")}
+</div>"""
+    else:
+        plots = ""
+
     body = f"""
 {_header("Activity", email, "logs")}
 <div class="card">
@@ -843,6 +870,7 @@ def logs_page(
     <div><b>{esc(stats.get('errors', 0))}</b><span>failed or refused</span></div>
   </div>
 </div>
+{plots}
 
 <form method="get" action="/logs" class="card filters">
   <label for="f_connection">Connector<select id="f_connection" name="connection_id">
