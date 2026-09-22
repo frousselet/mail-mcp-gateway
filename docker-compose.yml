@@ -1,0 +1,69 @@
+# Mail MCP Gateway.
+#
+# The default service is the multi-user web UI. `docker compose up` needs NO
+# configuration:
+#   - the encryption key is generated and persisted on the data volume,
+#   - the public URL is detected from each request.
+# Users self-register with passkeys at http://<host>:${MCP_PORT}/, create their
+# own connectors and attach their own mailboxes. Put an HTTPS reverse proxy in
+# front for public use (passkeys require HTTPS except on localhost).
+#
+# The single-mailbox modes below are opt-in, behind profiles.
+
+services:
+  # Multi-user onboarding UI + OAuth-protected MCP endpoint (default).
+  mail-mcp:
+    build: .
+    entrypoint: ["mail-mcp-web"]
+    environment:
+      # All optional. In production set MAIL_PUBLIC_URL to the public https
+      # origin so the OAuth metadata matches exactly.
+      MAIL_PUBLIC_URL: ${MAIL_PUBLIC_URL:-}
+      MAIL_SECRET_KEY: ${MAIL_SECRET_KEY:-}
+      MAIL_RP_NAME: ${MAIL_RP_NAME:-Mail MCP Gateway}
+      MAIL_ONBOARD_CODE: ${MAIL_ONBOARD_CODE:-}
+      MAIL_OAUTH_REDIRECT_URIS: ${MAIL_OAUTH_REDIRECT_URIS:-}
+      MAIL_ALLOWED_HOSTS: ${MAIL_ALLOWED_HOSTS:-}
+      MAIL_STORE: /data/mail_connections.json
+      MAIL_LOG_LEVEL: ${MAIL_LOG_LEVEL:-INFO}
+    ports:
+      - "${MCP_PORT:-8000}:8000"
+    volumes:
+      - mail-data:/data
+    restart: unless-stopped
+
+  # One mailbox from the environment, served over HTTP. Opt-in:
+  #   docker compose --profile single up
+  mail-mcp-single:
+    build: .
+    command: ["--transport", "streamable-http", "--host", "0.0.0.0", "--port", "8000"]
+    environment:
+      MAIL_ADDRESS: ${MAIL_ADDRESS:-}
+      MAIL_PASSWORD: ${MAIL_PASSWORD:-}
+      MAIL_IMAP_HOST: ${MAIL_IMAP_HOST:-}
+      MAIL_IMAP_PORT: ${MAIL_IMAP_PORT:-993}
+      MAIL_IMAP_SECURITY: ${MAIL_IMAP_SECURITY:-ssl}
+      MAIL_SMTP_HOST: ${MAIL_SMTP_HOST:-}
+      MAIL_SMTP_PORT: ${MAIL_SMTP_PORT:-587}
+      MAIL_SMTP_SECURITY: ${MAIL_SMTP_SECURITY:-starttls}
+      MAIL_READ_ONLY: ${MAIL_READ_ONLY:-}
+      MAIL_ACCOUNTS_FILE: ${MAIL_ACCOUNTS_FILE:-}
+    ports:
+      - "${MCP_PORT:-8000}:8000"
+    restart: unless-stopped
+    profiles: ["single"]
+
+  # One mailbox over stdio (an agent spawning the server itself). Opt-in:
+  #   docker compose run --rm mail-mcp-stdio
+  mail-mcp-stdio:
+    build: .
+    environment:
+      MAIL_ADDRESS: ${MAIL_ADDRESS:-}
+      MAIL_PASSWORD: ${MAIL_PASSWORD:-}
+      MAIL_IMAP_HOST: ${MAIL_IMAP_HOST:-}
+      MAIL_SMTP_HOST: ${MAIL_SMTP_HOST:-}
+    stdin_open: true
+    profiles: ["stdio"]
+
+volumes:
+  mail-data:
