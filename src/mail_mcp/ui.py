@@ -243,17 +243,41 @@ def dashboard_page(
                     "<p class='muted'>No mailbox yet. Add one to make this "
                     "connector useful.</p>"
                 )
+            calendars = connection.get("calendars", [])
+            if calendars:
+                calendar_rows = "".join(
+                    f"<tr><td>{esc(calendar['address'])}"
+                    + (" <small>(default)</small>" if calendar["is_default"] else "")
+                    + f"<br><small class='muted'>{esc(calendar['url'])}"
+                    f" | {esc(calendar['timezone'])}"
+                    + (" | read-only" if calendar["read_only"] else "")
+                    + "</small></td>"
+                    f"<td style='width:1%;white-space:nowrap'>"
+                    f'<form method="post" action="/calendars/delete" style="display:inline">'
+                    f'<input type="hidden" name="connection_id" value="{esc(connection["connection_id"])}">'
+                    f'<input type="hidden" name="calendar_id" value="{esc(calendar["account_id"])}">'
+                    f'<button class="small danger" '
+                    f"onclick=\"return confirm('Remove {esc(calendar['address'])} from this connector?')\">"
+                    f"Remove</button></form></td></tr>"
+                    for calendar in calendars
+                )
+                table += (
+                    "<table><tr><th>Calendar account</th><th></th></tr>"
+                    + calendar_rows
+                    + "</table>"
+                )
             cards.append(f"""
 <div class="card">
   <div class="top">
     <h3 style="margin:0">{esc(connection['label'] or 'Connector')}</h3>
-    <span class="muted">{len(mailboxes)} mailbox(es)</span>
+    <span class="muted">{len(mailboxes)} mailbox(es), {len(connection.get("calendars", []))} calendar(s)</span>
   </div>
   <div class="row muted">MCP URL: <code>{esc(connection['mcp_url'])}</code><br>
     OAuth client ID: <code>{esc(connection['client_id'])}</code></div>
   {table}
   <div class="inline">
     <a href="/connections/{esc(connection['connection_id'])}"><button class="small">Add a mailbox</button></a>
+    <a href="/connections/{esc(connection['connection_id'])}/calendar"><button class="small">Add a calendar</button></a>
     <form method="post" action="/connections/rotate" style="margin:0">
       <input type="hidden" name="connection_id" value="{esc(connection['connection_id'])}">
       <button class="small secondary"
@@ -522,4 +546,84 @@ def logs_page(
 Subjects, recipients, folders and UIDs are, so the log can answer what was sent
 and to whom.</p>
 {LOGS_JS}
+""")
+
+
+CALENDAR_JS = """
+<script>
+function calendarPayload(){
+ return {address:val('address'),secret:val('secret'),url:val('url'),
+  username:val('username'),timezone:val('timezone'),
+  default_calendar:val('default_calendar')};
+}
+async function testCalendar(){
+ const e=document.getElementById('probe');
+ e.className='muted';e.textContent='Connecting to the CalDAV server...';
+ try{
+  const j=await postJSON('/test-calendar',calendarPayload());
+  e.className=j.ok?'ok':'err';
+  e.textContent=j.message;
+  if(j.ok&&j.calendars&&j.calendars.length){
+   const sel=document.getElementById('default_calendar_pick');
+   sel.innerHTML='';
+   const none=document.createElement('option');
+   none.value='';none.textContent='(first calendar)';sel.appendChild(none);
+   for(const c of j.calendars){const o=document.createElement('option');
+    o.value=c.name;o.textContent=c.name+(c.read_only?' (read-only)':'');sel.appendChild(o);}
+   sel.style.display='block';
+   sel.onchange=function(){document.getElementById('default_calendar').value=this.value;};
+  }
+ }catch(x){e.className='err';e.textContent=x.message;}
+}
+</script>
+"""
+
+
+def calendar_form_page(connection: dict[str, Any], error: str = "") -> str:
+    """The form that attaches a CalDAV account to a connector."""
+    error_html = f'<p class="err">{esc(error)}</p>' if error else ""
+    return page(f"""
+<div class="top"><h1>Add a calendar</h1>
+  <span class="muted"><a href="/">Back to connectors</a></span></div>
+<p class="muted">Connector: <b>{esc(connection['label'])}</b></p>
+{error_html}
+<form method="post" action="/connections/{esc(connection['connection_id'])}/calendars"
+      class="card">
+  <label>Account address
+    <input id="address" name="address" type="email" required
+           placeholder="you@icloud.com"></label>
+  <label>Password
+    <input id="secret" name="secret" type="password" required autocomplete="off"></label>
+  <p class="muted">Apple iCloud needs an <b>app-specific password</b>
+    (appleid.apple.com &rarr; Sign-In and Security), not your Apple ID password.
+    The CalDAV server is filled in automatically for iCloud, Fastmail and
+    Google; enter it for anything else.</p>
+  <p id="probe" class="muted"></p>
+
+  <div class="grid">
+    <label>CalDAV URL <small>(optional for known providers)</small>
+      <input id="url" name="url" autocomplete="off"
+             placeholder="https://caldav.example.com"></label>
+    <label>Username <small>(defaults to the address)</small>
+      <input id="username" name="username" autocomplete="off"></label>
+    <label>Timezone <small>(how times without an offset are read)</small>
+      <input id="timezone" name="timezone" value="Europe/Paris"></label>
+    <label>Default calendar <small>(optional)</small>
+      <input id="default_calendar" name="default_calendar" autocomplete="off"
+             placeholder="Personal">
+      <select id="default_calendar_pick" style="display:none;margin-top:.3rem"></select>
+    </label>
+  </div>
+  <label><input type="checkbox" name="read_only" value="1">
+    Read-only <small>(the agent can read events but never create, change or
+    delete them)</small></label>
+
+  <div class="inline">
+    <button type="button" class="secondary" onclick="testCalendar()">Test connection</button>
+    <button type="submit">Add calendar</button>
+  </div>
+</form>
+{COMMON_JS}
+{MAILBOX_JS}
+{CALENDAR_JS}
 """)

@@ -17,6 +17,8 @@ import logging
 import os
 import sys
 import time
+from datetime import time as dtime
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -28,7 +30,17 @@ from mcp.server.transport_security import TransportSecuritySettings
 from mail_mcp import activity, formatting, mutf7, smtp_client
 from mail_mcp.accounts import AccountConfigError, AccountSet, MailAccount
 from mail_mcp.activity import ActivityEntry, ActivityLog
+from mail_mcp.caldav_client import CalDavClient, CalDavError
+from mail_mcp.calendars import CalendarAccount, CalendarConfigError, CalendarSet
 from mail_mcp.composer import ComposeError, build_forward, build_message, build_reply
+from mail_mcp.events import (
+    EventError,
+    build_event,
+    edit_event,
+    parse_when,
+    set_participation,
+)
+from mail_mcp.events import zone as event_zone
 from mail_mcp.imap_client import ImapClient, ImapError
 from mail_mcp.message import parse_headers, parse_message, truncate
 from mail_mcp.search import SearchError, build_criteria, describe
@@ -49,20 +61,31 @@ REGISTRY = None  # type: ignore[assignment]
 OAUTH_PROVIDER = None  # type: ignore[assignment]
 
 INSTRUCTIONS = (
-    "Read and send email over IMAP/SMTP for the mailbox(es) attached to this "
-    "connection.\n\n"
-    "Start with `list_accounts` to see which addresses are available: every "
-    "tool takes an optional `account` (an address, a label or an id) and falls "
-    "back to the connection's default mailbox when it is omitted.\n\n"
-    "Reading: `list_folders`, `list_messages`, `search_messages`, `get_message`, "
-    "`get_thread`, `get_attachment`, `folder_status`.\n"
-    "Writing: `send_message`, `reply_message`, `forward_message`, `save_draft`, "
-    "`mark_messages`, `move_messages`, `delete_messages`, `create_folder`.\n\n"
+    "Read and send email (IMAP/SMTP) and read and write calendars (CalDAV, "
+    "including Apple iCloud) for the accounts attached to this connection.\n\n"
+    "Start with `list_accounts` to see which mailboxes and calendar accounts "
+    "are available: every tool takes an optional `account` (an address, a label "
+    "or an id) and falls back to the connection's default.\n\n"
+    "Mail, reading: `list_folders`, `list_messages`, `search_messages`, "
+    "`get_message`, `get_thread`, `get_attachment`, `folder_status`.\n"
+    "Mail, writing: `send_message`, `reply_message`, `forward_message`, "
+    "`save_draft`, `mark_messages`, `move_messages`, `delete_messages`, "
+    "`create_folder`.\n"
+    "Calendars, reading: `list_calendars`, `list_events`, `search_events`, "
+    "`get_event`, `find_free_time`.\n"
+    "Calendars, writing: `create_event`, `update_event`, `delete_event`, "
+    "`respond_to_event`.\n\n"
     "Messages are identified by their IMAP UID **within a folder**, so pass the "
     "same `folder` you listed them from. UIDs are stable, but they are not "
     "shared between folders: after a move, list again to get the new UID.\n\n"
-    "Sending is real and irreversible: confirm recipients and content with the "
-    "user before calling `send_message`, `reply_message` or `forward_message`."
+    "Events are identified by their UID, which does not change. Times may be "
+    "given as 2026-09-24T10:00, a plain date, \'today\', \'tomorrow\' or an "
+    "offset such as \'+7d\'; a time written without an offset is read in the "
+    "calendar account\'s own timezone.\n\n"
+    "Sending mail and writing to a calendar are real, irreversible and visible "
+    "to other people: confirm recipients, times and content with the user "
+    "before calling `send_message`, `reply_message`, `forward_message`, "
+    "`create_event`, `update_event`, `delete_event` or `respond_to_event`."
 )
 
 
@@ -151,8 +174,33 @@ def _env_account_set() -> AccountSet:
     return AccountSet(accounts=accounts, default_account_id=default_id)
 
 
+def _calendar_from_env() -> CalendarAccount | None:
+    address = os.environ.get("MAIL_CALDAV_ADDRESS", "").strip()
+    if not address:
+        return None
+    return CalendarAccount(
+        address=address,
+        account_id="cal_env",
+        url=os.environ.get("MAIL_CALDAV_URL", "").strip(),
+        username=os.environ.get("MAIL_CALDAV_USERNAME", "").strip(),
+        secret=os.environ.get("MAIL_CALDAV_PASSWORD", ""),
+        timezone=os.environ.get("MAIL_CALDAV_TIMEZONE", "UTC").strip() or "UTC",
+        default_calendar=os.environ.get("MAIL_CALDAV_DEFAULT_CALENDAR", "").strip(),
+        verify_ssl=_bool_env("MAIL_VERIFY_SSL", True),
+        read_only=_bool_env("MAIL_CALDAV_READ_ONLY", False),
+        timeout=float(os.environ.get("MAIL_TIMEOUT", "30")),
+    )
+
+
+def _env_calendar_set() -> CalendarSet:
+    calendar = _calendar_from_env()
+    return CalendarSet(accounts=[calendar] if calendar else [])
+
+
 _ENV_ACCOUNTS: AccountSet | None = None
 _ENV_CLIENTS: dict[str, ImapClient] = {}
+_ENV_CALENDARS: CalendarSet | None = None
+_ENV_CALDAV: dict[str, CalDavClient] = {}
 
 
 ACTIVITY = ActivityLog()
@@ -302,11 +350,75 @@ def _resolve(selector: str | None) -> tuple[MailAccount, ImapClient]:
     return account, client
 
 
+def _current_calendar_set() -> CalendarSet:
+    if _MULTITENANT:
+        token = get_access_token()
+        if token is None:
+            raise ToolError("Unauthenticated: missing or invalid access token.")
+        calendar_set = (
+            REGISTRY.calendar_set_for_client_id(token.client_id) if REGISTRY else None
+        )
+        if calendar_set is None:
+            raise ToolError("Unknown connection for the presented credentials.")
+        return calendar_set
+
+    global _ENV_CALENDARS
+    if _ENV_CALENDARS is None:
+        _ENV_CALENDARS = _env_calendar_set()
+    return _ENV_CALENDARS
+
+
+def _resolve_calendar(selector: str | None) -> tuple[CalendarAccount, CalDavClient]:
+    """Find the calendar account a call is about and its live CalDAV client."""
+    account = _current_calendar_set().resolve(selector)
+    activity.note_account(account.address)
+    if _MULTITENANT and REGISTRY is not None:
+        token = get_access_token()
+        client = REGISTRY.caldav_for(token.client_id if token else "", account)
+    else:
+        client = _ENV_CALDAV.get(account.account_id)
+        if client is None:
+            client = CalDavClient(account)
+            _ENV_CALDAV[account.account_id] = client
+    return account, client
+
+
+async def _find_event(client: CalDavClient, uid: str, calendar: str | None):
+    """Locate an event by UID: the named calendar first, then the others."""
+    record, target = await client.find_by_uid(uid, calendar=calendar)
+    if record is not None:
+        return record, target
+    if calendar:
+        raise CalDavError(
+            f"No event with UID {uid} in {target.name!r}. "
+            "List the events again, or pass another calendar."
+        )
+    for candidate in await client.list_calendars():
+        if candidate.name == target.name:
+            continue
+        record, found = await client.find_by_uid(uid, calendar=candidate.name)
+        if record is not None:
+            return record, found
+    raise CalDavError(
+        f"No event with UID {uid} in this account. It may have been deleted."
+    )
+
+
 def _handle(error: Exception) -> str:
     """Turn an internal error into the text the agent sees, and log it."""
-    if isinstance(error, (ImapError, SmtpError)):
+    if isinstance(error, (ImapError, SmtpError, CalDavError)):
         message = f"Error: {error.message} {error.detail}".strip()
-    elif isinstance(error, (AccountConfigError, ComposeError, SearchError, ToolError)):
+    elif isinstance(
+        error,
+        (
+            AccountConfigError,
+            CalendarConfigError,
+            ComposeError,
+            EventError,
+            SearchError,
+            ToolError,
+        ),
+    ):
         message = f"Error: {error}"
     else:
         logger.exception("Unexpected failure in a tool call")
@@ -351,15 +463,24 @@ async def _summaries(
 
 @mcp.tool()
 async def list_accounts() -> str:
-    """List the mailboxes (email addresses) this connection can use.
+    """List the mailboxes and calendar accounts this connection can use.
 
     Every other tool takes an optional `account` argument naming one of these,
-    by address, label or id. Omit it and the default mailbox is used.
+    by address, label or id. Omit it and the default is used. Mail tools look
+    at the mailboxes, calendar tools at the calendar accounts.
     """
     try:
         account_set = _current_account_set()
-        return formatting.format_accounts(
-            list(account_set.accounts), account_set.default_account_id
+        calendar_set = _current_calendar_set()
+        return "\n\n".join(
+            [
+                formatting.format_accounts(
+                    list(account_set.accounts), account_set.default_account_id
+                ),
+                formatting.format_calendar_accounts(
+                    list(calendar_set.accounts), calendar_set.default_account_id
+                ),
+            ]
         )
     except Exception as e:
         return _handle(e)
@@ -1076,6 +1197,451 @@ async def create_folder(name: str, account: str | None = None) -> str:
     except Exception as e:
         return _handle(e)
 
+
+
+# ---------------------------------------------------------------------------
+# Tools: calendars (CalDAV)
+# ---------------------------------------------------------------------------
+
+
+def _ensure_calendar_writable(account: CalendarAccount, action: str) -> None:
+    """Stop a read-only calendar account before anything is written."""
+    if account.read_only:
+        error = ToolError(
+            f"{account.address} is connected read-only, so {action} is not allowed. "
+            "Change that in the web UI if you meant to."
+        )
+        error.activity_status = "denied"
+        raise error
+
+
+@mcp.tool()
+async def list_calendars(account: str | None = None) -> str:
+    """List the calendars of a calendar account, and whether they are writable.
+
+    Args:
+        account: Which calendar account to read (address, label or id).
+    """
+    try:
+        calendar_account, client = _resolve_calendar(account)
+        calendars = await client.list_calendars(refresh=True)
+        return formatting.format_calendars(calendars, calendar_account)
+    except Exception as e:
+        return _handle(e)
+
+
+@mcp.tool()
+async def list_events(
+    start: str = "today",
+    end: str = "+7d",
+    calendar: str | None = None,
+    limit: int = 50,
+    account: str | None = None,
+) -> str:
+    """List the events in a time window, earliest first.
+
+    Args:
+        start: Start of the window (2026-09-24, 2026-09-24T10:00, 'today', '+1d').
+        end: End of the window, same formats (default: seven days out).
+        calendar: Which calendar to read; omit for the account's default.
+        limit: How many events to return (default 50).
+        account: Which calendar account to read (address, label or id).
+    """
+    try:
+        calendar_account, client = _resolve_calendar(account)
+        tz = calendar_account.timezone
+        window_start = parse_when(start, tz)
+        window_end = parse_when(end, tz, end_of_day=True)
+        if window_end < window_start:
+            return "Error: the window ends before it starts."
+        events, target = await client.events_between(
+            window_start, window_end, calendar=calendar
+        )
+        return formatting.format_events(
+            events[: max(1, limit)],
+            account=calendar_account,
+            calendar=target.name,
+            window=f"from {window_start.date()} to {window_end.date()}",
+        )
+    except Exception as e:
+        return _handle(e)
+
+
+@mcp.tool()
+async def search_events(
+    query: str,
+    start: str = "-30d",
+    end: str = "+90d",
+    calendar: str | None = None,
+    limit: int = 25,
+    account: str | None = None,
+) -> str:
+    """Find events whose title, location, description or attendees match some text.
+
+    CalDAV has no full-text search, so the window is fetched and filtered here:
+    keep it reasonable rather than scanning years.
+
+    Args:
+        query: Text to look for, case-insensitive.
+        start: Start of the window to search (default: 30 days back).
+        end: End of the window to search (default: 90 days ahead).
+        calendar: Which calendar to search; omit for the account's default.
+        limit: How many events to return (default 25).
+        account: Which calendar account to search (address, label or id).
+    """
+    try:
+        calendar_account, client = _resolve_calendar(account)
+        tz = calendar_account.timezone
+        window_start = parse_when(start, tz)
+        window_end = parse_when(end, tz, end_of_day=True)
+        events, target = await client.events_between(
+            window_start, window_end, calendar=calendar
+        )
+        wanted = query.strip().lower()
+        matches = [
+            event
+            for event in events
+            if wanted
+            in " ".join(
+                [
+                    event.summary,
+                    event.location,
+                    event.description,
+                    " ".join(a.email for a in event.attendees),
+                ]
+            ).lower()
+        ]
+        return formatting.format_events(
+            matches[: max(1, limit)],
+            account=calendar_account,
+            calendar=target.name,
+            window=f"from {window_start.date()} to {window_end.date()}",
+            query=query,
+        )
+    except Exception as e:
+        return _handle(e)
+
+
+@mcp.tool()
+async def get_event(
+    uid: str, calendar: str | None = None, account: str | None = None
+) -> str:
+    """Read one event in full, by its UID.
+
+    Args:
+        uid: The event UID, as shown by list_events or search_events.
+        calendar: Which calendar it lives in; omit to search the account's calendars.
+        account: Which calendar account to read (address, label or id).
+    """
+    try:
+        calendar_account, client = _resolve_calendar(account)
+        event, target = await _find_event(client, uid, calendar)
+        return formatting.format_event(
+            event, account=calendar_account, calendar=target.name
+        )
+    except Exception as e:
+        return _handle(e)
+
+
+@mcp.tool()
+async def create_event(
+    summary: str,
+    start: str,
+    end: str | None = None,
+    duration_minutes: int = 60,
+    all_day: bool = False,
+    location: str = "",
+    description: str = "",
+    attendees: str | None = None,
+    recurrence: str = "",
+    calendar: str | None = None,
+    account: str | None = None,
+) -> str:
+    """Create an event. This is real and other attendees may be notified.
+
+    Args:
+        summary: The event title.
+        start: When it starts (2026-09-24T10:00, 'tomorrow', '+2d').
+        end: When it ends; omit to use duration_minutes instead.
+        duration_minutes: Length when no end is given (default 60).
+        all_day: Book whole days rather than a time range.
+        location: Where it happens.
+        description: Longer notes for the event body.
+        attendees: Comma-separated invitees ("Bob <bob@x.test>, carol@x.test").
+        recurrence: 'daily', 'weekly', 'monthly', 'yearly', or a full rule such
+            as 'FREQ=WEEKLY;BYDAY=MO,WE;COUNT=10'.
+        calendar: Which calendar to write to; omit for the account's default.
+        account: Which calendar account to use (address, label or id).
+    """
+    try:
+        calendar_account, client = _resolve_calendar(account)
+        _ensure_calendar_writable(calendar_account, "creating events")
+        tz = calendar_account.timezone
+        starts = parse_when(start, tz)
+        if end:
+            ends = parse_when(end, tz, end_of_day=all_day)
+        else:
+            ends = starts + timedelta(minutes=max(1, duration_minutes))
+        uid, ics = build_event(
+            summary=summary,
+            start=starts,
+            end=ends,
+            all_day=all_day,
+            description=description,
+            location=location,
+            attendees=attendees,
+            organizer=calendar_account.address,
+            recurrence=recurrence,
+        )
+        _, target = await client.create(ics, uid, calendar=calendar)
+        return formatting.format_action(
+            f"Created **{summary}** in {target.name} ({calendar_account.address}).",
+            when=f"{starts.isoformat()} to {ends.isoformat()}",
+            location=location,
+            attendees=attendees,
+            repeats=recurrence,
+            uid=uid,
+        )
+    except Exception as e:
+        return _handle(e)
+
+
+@mcp.tool()
+async def update_event(
+    uid: str,
+    summary: str | None = None,
+    start: str | None = None,
+    end: str | None = None,
+    location: str | None = None,
+    description: str | None = None,
+    attendees: str | None = None,
+    recurrence: str | None = None,
+    status: str | None = None,
+    calendar: str | None = None,
+    account: str | None = None,
+) -> str:
+    """Change an existing event. Only the fields you pass are touched.
+
+    The event is re-read before writing and the write is conditional, so a
+    change someone else made in the meantime is reported rather than lost.
+
+    Args:
+        uid: The UID of the event to change.
+        summary: New title.
+        start: New start; pass both start and end to move the event.
+        end: New end.
+        location: New location.
+        description: New notes.
+        attendees: Replacement attendee list, comma-separated.
+        recurrence: New recurrence rule, or "" to make it a one-off.
+        status: CONFIRMED, TENTATIVE or CANCELLED.
+        calendar: Which calendar it lives in; omit to search the account's calendars.
+        account: Which calendar account to use (address, label or id).
+    """
+    try:
+        calendar_account, client = _resolve_calendar(account)
+        _ensure_calendar_writable(calendar_account, "changing events")
+        event, target = await _find_event(client, uid, calendar)
+        tz = calendar_account.timezone
+        updated = edit_event(
+            event.raw,
+            summary=summary,
+            start=parse_when(start, tz) if start else None,
+            end=parse_when(end, tz) if end else None,
+            location=location,
+            description=description,
+            attendees=attendees,
+            recurrence=recurrence,
+            status=status,
+        )
+        await client.replace(event.href, updated, etag=event.etag)
+        changed = [
+            name
+            for name, value in (
+                ("title", summary),
+                ("start", start),
+                ("end", end),
+                ("location", location),
+                ("description", description),
+                ("attendees", attendees),
+                ("recurrence", recurrence),
+                ("status", status),
+            )
+            if value is not None
+        ]
+        return formatting.format_action(
+            f"Updated **{summary or event.summary}** in {target.name} "
+            f"({calendar_account.address}).",
+            changed=", ".join(changed) or "nothing",
+            uid=uid,
+        )
+    except Exception as e:
+        return _handle(e)
+
+
+@mcp.tool()
+async def delete_event(
+    uid: str, calendar: str | None = None, account: str | None = None
+) -> str:
+    """Delete an event. This cannot be undone, and attendees may be notified.
+
+    Args:
+        uid: The UID of the event to delete.
+        calendar: Which calendar it lives in; omit to search the account's calendars.
+        account: Which calendar account to use (address, label or id).
+    """
+    try:
+        calendar_account, client = _resolve_calendar(account)
+        _ensure_calendar_writable(calendar_account, "deleting events")
+        event, target = await _find_event(client, uid, calendar)
+        await client.delete(event.href, etag=event.etag)
+        return formatting.format_action(
+            f"Deleted **{event.summary or uid}** from {target.name} "
+            f"({calendar_account.address}). This cannot be undone.",
+            uid=uid,
+        )
+    except Exception as e:
+        return _handle(e)
+
+
+@mcp.tool()
+async def respond_to_event(
+    uid: str,
+    response: str,
+    calendar: str | None = None,
+    account: str | None = None,
+) -> str:
+    """Answer an invitation: accept, decline or tentative.
+
+    This sets your participation status on the event; the server relays the
+    reply to the organizer if it supports CalDAV scheduling, as iCloud does.
+
+    Args:
+        uid: The UID of the invitation.
+        response: accept, decline or tentative.
+        calendar: Which calendar it lives in; omit to search the account's calendars.
+        account: Which calendar account to answer as (address, label or id).
+    """
+    try:
+        calendar_account, client = _resolve_calendar(account)
+        _ensure_calendar_writable(calendar_account, "answering invitations")
+        event, target = await _find_event(client, uid, calendar)
+        answered = set_participation(event.raw, calendar_account.address, response)
+        await client.replace(event.href, answered, etag=event.etag)
+        return formatting.format_action(
+            f"Answered **{event.summary or uid}** as {response.lower()} "
+            f"({calendar_account.address}).",
+            calendar=target.name,
+            organizer=event.organizer,
+            uid=uid,
+        )
+    except Exception as e:
+        return _handle(e)
+
+
+@mcp.tool()
+async def find_free_time(
+    start: str = "today",
+    end: str = "+7d",
+    duration_minutes: int = 60,
+    day_start_hour: int = 9,
+    day_end_hour: int = 18,
+    calendar: str | None = None,
+    account: str | None = None,
+) -> str:
+    """Find slots with nothing booked, within working hours.
+
+    Args:
+        start: Start of the search window ('today', a date, '+1d').
+        end: End of the search window (default: seven days out).
+        duration_minutes: The shortest slot worth reporting (default 60).
+        day_start_hour: First hour of the working day, local time (default 9).
+        day_end_hour: Last hour of the working day, local time (default 18).
+        calendar: Which calendar counts as busy; omit for the account's default.
+        account: Which calendar account to read (address, label or id).
+    """
+    try:
+        calendar_account, client = _resolve_calendar(account)
+        tz = calendar_account.timezone
+        window_start = parse_when(start, tz)
+        window_end = parse_when(end, tz, end_of_day=True)
+        events, target = await client.events_between(
+            window_start, window_end, calendar=calendar
+        )
+        slots = _free_slots(
+            events,
+            window_start,
+            window_end,
+            minutes=max(1, duration_minutes),
+            tz=tz,
+            day_start_hour=day_start_hour,
+            day_end_hour=day_end_hour,
+        )
+        return formatting.format_free_slots(
+            slots,
+            account=calendar_account,
+            calendar=target.name,
+            minutes=duration_minutes,
+        )
+    except Exception as e:
+        return _handle(e)
+
+
+def _free_slots(
+    events,
+    window_start,
+    window_end,
+    *,
+    minutes: int,
+    tz: str,
+    day_start_hour: int,
+    day_end_hour: int,
+):
+    """Working-hour gaps left by the busy periods of these events."""
+    from datetime import datetime as _datetime
+
+    info = event_zone(tz)
+    busy: list[tuple[Any, Any]] = []
+    for event in events:
+        if (event.status or "").upper() == "CANCELLED" or event.start is None:
+            continue
+        start, end = event.start, event.end or event.start
+        if not isinstance(start, _datetime):  # all-day: busy for the whole day
+            start = _datetime.combine(start, dtime(0, 0), tzinfo=info)
+            end = _datetime.combine(
+                end if not isinstance(end, _datetime) else end.date(),
+                dtime(0, 0),
+                tzinfo=info,
+            )
+        busy.append((start.astimezone(info), end.astimezone(info)))
+    busy.sort()
+
+    slots: list[tuple[Any, Any]] = []
+    day = window_start.astimezone(info).date()
+    last_day = window_end.astimezone(info).date()
+    span = timedelta(minutes=minutes)
+    while day <= last_day:
+        cursor = max(
+            _datetime.combine(day, dtime(day_start_hour, 0), tzinfo=info),
+            window_start.astimezone(info),
+        )
+        closing = (
+            dtime(23, 59) if day_end_hour >= 24 else dtime(max(0, day_end_hour), 0)
+        )
+        day_end = min(
+            _datetime.combine(day, closing, tzinfo=info),
+            window_end.astimezone(info),
+        )
+        for busy_start, busy_end in busy:
+            if busy_end <= cursor or busy_start >= day_end:
+                continue
+            if busy_start - cursor >= span:
+                slots.append((cursor, busy_start))
+            cursor = max(cursor, busy_end)
+        if day_end - cursor >= span:
+            slots.append((cursor, day_end))
+        day += timedelta(days=1)
+    return slots
 
 # ---------------------------------------------------------------------------
 # Entry point

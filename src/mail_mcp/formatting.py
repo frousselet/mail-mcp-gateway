@@ -11,6 +11,7 @@ from datetime import datetime
 from typing import Any
 
 from mail_mcp.accounts import MailAccount
+from mail_mcp.events import EventRecord
 from mail_mcp.imap_client import FolderInfo
 from mail_mcp.message import ParsedMessage
 
@@ -205,4 +206,171 @@ def format_action(message: str, **details: Any) -> str:
     for key, value in details.items():
         if value not in (None, "", [], {}):
             lines.append(f"{key.replace('_', ' ').capitalize()}: {value}")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Calendars
+# ---------------------------------------------------------------------------
+
+
+def _event_when(event: EventRecord, tz: str = "UTC") -> str:
+    """Render an event's span the way a person reads it."""
+    from datetime import date, datetime
+
+    from mail_mcp.events import zone
+
+    start, end = event.start, event.end
+    if start is None:
+        return "(no start)"
+    if event.all_day or (isinstance(start, date) and not isinstance(start, datetime)):
+        if end is not None and getattr(end, "toordinal", None) and end != start:
+            last = end
+            try:  # DTEND of an all-day event is exclusive
+                from datetime import timedelta
+
+                last = end - timedelta(days=1)
+            except TypeError:
+                pass
+            if last != start:
+                return f"{start} to {last} (all day)"
+        return f"{start} (all day)"
+
+    local_start = start.astimezone(zone(tz))
+    if end is None:
+        return local_start.strftime("%Y-%m-%d %H:%M")
+    local_end = end.astimezone(zone(tz))
+    if local_start.date() == local_end.date():
+        return (
+            f"{local_start.strftime('%Y-%m-%d %H:%M')}"
+            f" to {local_end.strftime('%H:%M')}"
+        )
+    return (
+        f"{local_start.strftime('%Y-%m-%d %H:%M')}"
+        f" to {local_end.strftime('%Y-%m-%d %H:%M')}"
+    )
+
+
+def format_calendar_accounts(accounts: list[Any], default_account_id: str = "") -> str:
+    if not accounts:
+        return (
+            "No calendar is attached to this connection. Add one in the web UI, "
+            "then call this tool again."
+        )
+    lines = [f"{len(accounts)} calendar account(s) on this connection:\n"]
+    for account in accounts:
+        mark = " (default)" if account.account_id == default_account_id else ""
+        lines.append(f"- **{account.address}**{mark}")
+        lines.append(f"  Server: {account.entry_point()}")
+        lines.append(f"  Timezone: {account.timezone}"
+                     + (" | read-only" if account.read_only else ""))
+        lines.append("")
+    return "\n".join(lines)
+
+
+def format_calendars(calendars: list[Any], account: Any) -> str:
+    if not calendars:
+        return f"{account.address} has no calendar the agent can use."
+    lines = [f"{len(calendars)} calendar(s) for {account.address}:\n"]
+    for calendar in calendars:
+        flags = " (read-only)" if calendar.read_only else ""
+        lines.append(f"- **{calendar.name}**{flags}")
+        if calendar.description:
+            lines.append(f"  {calendar.description}")
+        lines.append(f"  Path: `{calendar.href}`")
+    lines.append("")
+    lines.append("Pass `calendar` to any calendar tool to pick one by name.")
+    return "\n".join(lines)
+
+
+def format_events(
+    events: list[Any],
+    *,
+    account: Any,
+    calendar: str,
+    window: str = "",
+    query: str = "",
+) -> str:
+    if not events:
+        detail = f" matching {query!r}" if query else ""
+        return f"No event{detail} in {calendar} ({account.address}) {window}.".replace(
+            "  ", " "
+        )
+    header = f"{len(events)} event(s) in {calendar} ({account.address})"
+    if window:
+        header += f" {window}"
+    if query:
+        header += f", matching {query!r}"
+    lines = [header, ""]
+    for event in events:
+        line = f"- **{event.summary or '(no title)'}**"
+        if event.status and event.status.upper() == "CANCELLED":
+            line += " [cancelled]"
+        lines.append(line)
+        lines.append(f"  {_event_when(event, account.timezone)}")
+        if event.location:
+            lines.append(f"  Location: {event.location}")
+        if event.attendees:
+            lines.append(f"  Attendees: {len(event.attendees)}")
+        if event.recurrence:
+            lines.append(f"  Repeats: {event.recurrence}")
+        lines.append(f"  UID: `{event.uid}`")
+    lines.append("")
+    lines.append("Use `get_event` with a UID to see one in full.")
+    return "\n".join(lines)
+
+
+def format_event(event: Any, *, account: Any, calendar: str) -> str:
+    lines = [
+        f"**{event.summary or '(no title)'}**",
+        "",
+        f"When: {_event_when(event, account.timezone)}",
+    ]
+    if event.location:
+        lines.append(f"Location: {event.location}")
+    if event.organizer:
+        lines.append(f"Organizer: {event.organizer}")
+    if event.status:
+        lines.append(f"Status: {event.status}")
+    if event.recurrence:
+        lines.append(f"Repeats: {event.recurrence}")
+    lines.append(f"Calendar: {calendar} | Account: {account.address}")
+    lines.append(f"UID: `{event.uid}`")
+    if event.attendees:
+        lines.append("")
+        lines.append("Attendees:")
+        for attendee in event.attendees:
+            lines.append(f"- {attendee.describe()}")
+    if event.description:
+        lines.append("")
+        lines.append("---")
+        lines.append("")
+        lines.append(event.description)
+    return "\n".join(lines)
+
+
+def format_free_slots(
+    slots: list[tuple[Any, Any]], *, account: Any, calendar: str, minutes: int
+) -> str:
+    from mail_mcp.events import zone
+
+    if not slots:
+        return (
+            f"No free slot of {minutes} minutes in {calendar} ({account.address}) "
+            "within that window."
+        )
+    info = zone(account.timezone)
+    lines = [
+        f"{len(slots)} free slot(s) of at least {minutes} minutes "
+        f"({account.address}, times in {account.timezone}):\n"
+    ]
+    for start, end in slots:
+        local_start, local_end = start.astimezone(info), end.astimezone(info)
+        same_day = local_start.date() == local_end.date()
+        ending = (
+            local_end.strftime("%H:%M")
+            if same_day
+            else local_end.strftime("%Y-%m-%d %H:%M")
+        )
+        lines.append(f"- {local_start.strftime('%Y-%m-%d %H:%M')} to {ending}")
     return "\n".join(lines)

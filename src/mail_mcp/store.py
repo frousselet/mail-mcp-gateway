@@ -5,8 +5,10 @@ Vocabulary:
 - a **user** signs in to the web UI with a passkey and owns connections;
 - a **connection** is one MCP connector: an OAuth client (``client_id`` /
   ``client_secret``) that an agent uses against the shared ``/mcp`` endpoint;
-- a connection serves one or more **mailboxes** (:class:`~mail_mcp.accounts.MailAccount`),
-  so you can dedicate a connector to a single address or group several.
+- a connection serves one or more **mailboxes** (:class:`~mail_mcp.accounts.MailAccount`)
+  and any number of **calendar accounts**
+  (:class:`~mail_mcp.calendars.CalendarAccount`), so one connector can give an
+  agent the mail and the calendars of one person, or of several.
 
 Everything lives in one JSON file whose secrets (mailbox passwords, refresh
 tokens, OAuth client secrets) are sealed field-by-field with Fernet. Bearer
@@ -32,6 +34,7 @@ from typing import Any
 from cryptography.fernet import Fernet, InvalidToken
 
 from mail_mcp.accounts import AccountSet, MailAccount
+from mail_mcp.calendars import CalendarAccount, CalendarSet
 
 logger = logging.getLogger("mail-mcp.store")
 
@@ -91,12 +94,19 @@ class Connection:
     label: str = ""
     default_account_id: str = ""
     accounts: list[MailAccount] = field(default_factory=list)
+    calendars: list[CalendarAccount] = field(default_factory=list)
+    default_calendar_id: str = ""
     created_at: int = 0
     revision: int = 0
 
     def account_set(self) -> AccountSet:
         return AccountSet(
             accounts=list(self.accounts), default_account_id=self.default_account_id
+        )
+
+    def calendar_set(self) -> CalendarSet:
+        return CalendarSet(
+            accounts=list(self.calendars), default_account_id=self.default_calendar_id
         )
 
 
@@ -195,6 +205,8 @@ class ConnectionStore:
                 "label": label,
                 "default_account_id": "",
                 "accounts": {},
+                "calendars": {},
+                "default_calendar_id": "",
                 "created_at": int(time.time()),
                 "revision": 0,
             }
@@ -208,6 +220,11 @@ class ConnectionStore:
             secret = self._dec(account_record.get("secret_enc", ""))
             accounts.append(MailAccount.from_record(account_record, secret=secret))
         accounts.sort(key=lambda a: a.created_at)
+        calendars: list[CalendarAccount] = []
+        for calendar_record in record.get("calendars", {}).values():
+            secret = self._dec(calendar_record.get("secret_enc", ""))
+            calendars.append(CalendarAccount.from_record(calendar_record, secret=secret))
+        calendars.sort(key=lambda c: c.created_at)
         return Connection(
             connection_id=record["connection_id"],
             client_id=record["client_id"],
@@ -216,6 +233,8 @@ class ConnectionStore:
             label=record.get("label", ""),
             default_account_id=record.get("default_account_id", ""),
             accounts=accounts,
+            calendars=calendars,
+            default_calendar_id=record.get("default_calendar_id", ""),
             created_at=record.get("created_at", 0),
             revision=record.get("revision", 0),
         )
@@ -339,6 +358,46 @@ class ConnectionStore:
             if account_id not in record.get("accounts", {}):
                 return False
             record["default_account_id"] = account_id
+            record["revision"] = record.get("revision", 0) + 1
+            self._flush()
+            return True
+
+    # --- calendars inside a connection ---
+
+    async def add_calendar(
+        self, connection_id: str, calendar: CalendarAccount, owner_id: str | None = None
+    ) -> CalendarAccount | None:
+        async with self._lock:
+            record = self._data["connections"].get(connection_id)
+            if record is None:
+                return None
+            if owner_id is not None and record.get("owner_id", "") != owner_id:
+                return None
+            calendar.account_id = calendar.account_id or "cal_" + secrets.token_hex(6)
+            calendar.created_at = calendar.created_at or int(time.time())
+            stored = calendar.to_record()
+            stored["secret_enc"] = self._enc(calendar.secret)
+            record.setdefault("calendars", {})[calendar.account_id] = stored
+            if not record.get("default_calendar_id"):
+                record["default_calendar_id"] = calendar.account_id
+            record["revision"] = record.get("revision", 0) + 1
+            self._flush()
+            return calendar
+
+    async def remove_calendar(
+        self, connection_id: str, calendar_id: str, owner_id: str | None = None
+    ) -> bool:
+        async with self._lock:
+            record = self._data["connections"].get(connection_id)
+            if record is None:
+                return False
+            if owner_id is not None and record.get("owner_id", "") != owner_id:
+                return False
+            if record.get("calendars", {}).pop(calendar_id, None) is None:
+                return False
+            if record.get("default_calendar_id") == calendar_id:
+                remaining = list(record.get("calendars", {}))
+                record["default_calendar_id"] = remaining[0] if remaining else ""
             record["revision"] = record.get("revision", 0) + 1
             self._flush()
             return True
@@ -482,34 +541,54 @@ class ConnectionStore:
 # ---------------------------------------------------------------------------
 
 
+@dataclass
+class _RegistryEntry:
+    revision: int
+    accounts: AccountSet
+    calendars: CalendarSet
+    clients: dict[str, Any] = field(default_factory=dict)
+
+
 class MailboxRegistry:
-    """Keeps one live :class:`ImapClient` per mailbox, per connection.
+    """Keeps the live clients (IMAP and CalDAV) of one connection.
 
     Entries are rebuilt when the connection's ``revision`` changes, so editing
-    a mailbox in the web UI takes effect without a restart.
+    a mailbox or a calendar in the web UI takes effect without a restart.
     """
 
     def __init__(self, store: ConnectionStore):
         self._store = store
-        self._entries: dict[str, tuple[int, AccountSet, dict[str, Any]]] = {}
+        self._entries: dict[str, _RegistryEntry] = {}
         # Teardown tasks are kept until they finish so they are not garbage
         # collected mid-flight.
         self._closing: set[asyncio.Task[None]] = set()
 
-    def account_set_for_client_id(self, client_id: str) -> AccountSet | None:
+    def _entry(self, client_id: str) -> _RegistryEntry | None:
         connection = self._store.get_connection_by_client_id(client_id)
         if connection is None:
             return None
         cached = self._entries.get(client_id)
-        if cached is not None and cached[0] == connection.revision:
-            return cached[1]
+        if cached is not None and cached.revision == connection.revision:
+            return cached
         if cached is not None:
-            task = asyncio.get_event_loop().create_task(_close_clients(cached[2]))
+            task = asyncio.get_event_loop().create_task(_close_clients(cached.clients))
             self._closing.add(task)
             task.add_done_callback(self._closing.discard)
-        account_set = connection.account_set()
-        self._entries[client_id] = (connection.revision, account_set, {})
-        return account_set
+        entry = _RegistryEntry(
+            revision=connection.revision,
+            accounts=connection.account_set(),
+            calendars=connection.calendar_set(),
+        )
+        self._entries[client_id] = entry
+        return entry
+
+    def account_set_for_client_id(self, client_id: str) -> AccountSet | None:
+        entry = self._entry(client_id)
+        return entry.accounts if entry is not None else None
+
+    def calendar_set_for_client_id(self, client_id: str) -> CalendarSet | None:
+        entry = self._entry(client_id)
+        return entry.calendars if entry is not None else None
 
     def imap_for(self, client_id: str, account: MailAccount):
         from mail_mcp.imap_client import ImapClient
@@ -517,16 +596,27 @@ class MailboxRegistry:
         entry = self._entries.get(client_id)
         if entry is None:
             return ImapClient(account)
-        clients = entry[2]
-        client = clients.get(account.account_id)
+        client = entry.clients.get(account.account_id)
         if client is None:
             client = ImapClient(account)
-            clients[account.account_id] = client
+            entry.clients[account.account_id] = client
+        return client
+
+    def caldav_for(self, client_id: str, calendar: CalendarAccount):
+        from mail_mcp.caldav_client import CalDavClient
+
+        entry = self._entries.get(client_id)
+        if entry is None:
+            return CalDavClient(calendar)
+        client = entry.clients.get(calendar.account_id)
+        if client is None:
+            client = CalDavClient(calendar)
+            entry.clients[calendar.account_id] = client
         return client
 
     async def aclose(self) -> None:
-        for _, _, clients in self._entries.values():
-            await _close_clients(clients)
+        for entry in self._entries.values():
+            await _close_clients(entry.clients)
         self._entries.clear()
 
 

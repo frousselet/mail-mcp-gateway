@@ -8,6 +8,7 @@ required:
 - ``/connections/new``            create a connector (one MCP connection)
 - ``/logs``                       every tool call the connectors served
 - ``/connections/{id}``           attach a mailbox to a connector
+- ``/connections/{id}/calendar``  attach a CalDAV calendar account
 - ``/discover`` / ``/test``       look up provider settings, probe IMAP+SMTP
 - ``/mcp``                        the shared, OAuth-protected MCP endpoint
 - ``/authorize`` ``/token`` ``/.well-known/oauth-*``   the OAuth 2.1 server
@@ -57,6 +58,8 @@ from webauthn.helpers.structs import (
 
 from mail_mcp import discovery, server, smtp_client, ui
 from mail_mcp.accounts import AccountConfigError, MailAccount
+from mail_mcp.caldav_client import CalDavClient, CalDavError
+from mail_mcp.calendars import CalendarAccount, CalendarConfigError
 from mail_mcp.imap_client import ImapClient, ImapError
 from mail_mcp.oauth import SCOPE, _redirect_uris
 from mail_mcp.smtp_client import SmtpError
@@ -123,6 +126,17 @@ def _connection_view(connection, base_url: str) -> dict[str, Any]:
                 "is_default": account.account_id == connection.default_account_id,
             }
             for account in connection.accounts
+        ],
+        "calendars": [
+            {
+                "account_id": calendar.account_id,
+                "address": calendar.address,
+                "url": calendar.entry_point(),
+                "timezone": calendar.timezone,
+                "read_only": calendar.read_only,
+                "is_default": calendar.account_id == connection.default_calendar_id,
+            }
+            for calendar in connection.calendars
         ],
     }
 
@@ -477,6 +491,128 @@ async def mailbox_default(request: Request) -> Response:
     if store and connection_id and account_id:
         await store.set_default_account(connection_id, account_id, owner_id=uid)
     return RedirectResponse("/", status_code=303)
+
+
+# ---------------------------------------------------------------------------
+# Calendars
+# ---------------------------------------------------------------------------
+
+
+def _calendar_from_form(form: Any) -> CalendarAccount:
+    """Build a CalendarAccount from the add-calendar form (without validating)."""
+
+    def field(name: str, default: str = "") -> str:
+        return str(form.get(name, default) or "").strip()
+
+    return CalendarAccount(
+        address=field("address"),
+        url=field("url"),
+        username=field("username"),
+        secret=str(form.get("secret", "") or ""),
+        timezone=field("timezone", "UTC") or "UTC",
+        default_calendar=field("default_calendar"),
+        read_only=bool(form.get("read_only")),
+    )
+
+
+async def _probe_calendar(account: CalendarAccount) -> dict[str, Any]:
+    """Try the CalDAV server with these settings; never raises."""
+    try:
+        client = CalDavClient(account)
+    except CalDavError as e:
+        return {"ok": False, "message": e.message}
+    try:
+        report = await client.check()
+    except CalDavError as e:
+        return {"ok": False, "message": f"{e.message} {e.detail}".strip()}
+    finally:
+        await client.close()
+
+    names = ", ".join(c["name"] for c in report["calendars"]) or "none"
+    return {
+        "ok": True,
+        "message": f"Connected. Calendars found: {names}.",
+        "calendars": report["calendars"],
+    }
+
+
+@mcp.custom_route("/connections/{connection_id}/calendar", methods=["GET"])
+async def calendar_form(request: Request) -> Response:
+    uid = _uid(request)
+    if not uid:
+        return RedirectResponse("/login", status_code=303)
+    store = _store()
+    connection_id = request.path_params["connection_id"]
+    connection = store.get_connection(connection_id) if store else None
+    if connection is None or connection.owner_id != uid:
+        return _dashboard(request, error="That connector no longer exists.")
+    return HTMLResponse(
+        ui.calendar_form_page(_connection_view(connection, _base_url(request)))
+    )
+
+
+@mcp.custom_route("/connections/{connection_id}/calendars", methods=["POST"])
+async def calendar_add(request: Request) -> Response:
+    uid = _uid(request)
+    if not uid:
+        return RedirectResponse("/login", status_code=303)
+    store = _store()
+    connection_id = request.path_params["connection_id"]
+    connection = store.get_connection(connection_id) if store else None
+    if connection is None or connection.owner_id != uid:
+        return _dashboard(request, error="That connector no longer exists.")
+
+    view = _connection_view(connection, _base_url(request))
+    form = await request.form()
+    calendar = _calendar_from_form(form)
+    try:
+        calendar.validate()
+    except CalendarConfigError as e:
+        return HTMLResponse(ui.calendar_form_page(view, error=str(e)), status_code=400)
+
+    probe = await _probe_calendar(calendar)
+    if not probe["ok"]:
+        return HTMLResponse(
+            ui.calendar_form_page(
+                view, error=f"{probe['message']} The calendar was not saved."
+            ),
+            status_code=400,
+        )
+
+    saved = await store.add_calendar(connection_id, calendar, owner_id=uid)
+    if saved is None:
+        return _dashboard(request, error="Could not attach that calendar.")
+    logger.info("User %s attached calendar %s to %s", uid, calendar.address, connection_id)
+    return _dashboard(
+        request, notice=f"{calendar.address} calendars are now available to this connector."
+    )
+
+
+@mcp.custom_route("/calendars/delete", methods=["POST"])
+async def calendar_delete(request: Request) -> Response:
+    uid = _uid(request)
+    if not uid:
+        return RedirectResponse("/login", status_code=303)
+    store = _store()
+    form = await request.form()
+    connection_id = str(form.get("connection_id", ""))
+    calendar_id = str(form.get("calendar_id", ""))
+    if store and connection_id and calendar_id:
+        await store.remove_calendar(connection_id, calendar_id, owner_id=uid)
+    return RedirectResponse("/", status_code=303)
+
+
+@mcp.custom_route("/test-calendar", methods=["POST"])
+async def test_calendar(request: Request) -> JSONResponse:
+    if not _uid(request):
+        return JSONResponse({"error": "sign in first"}, status_code=401)
+    payload = await request.json()
+    try:
+        calendar = _calendar_from_form(payload)
+        calendar.validate()
+    except CalendarConfigError as e:
+        return JSONResponse({"ok": False, "message": str(e)})
+    return JSONResponse(await _probe_calendar(calendar))
 
 
 # ---------------------------------------------------------------------------
