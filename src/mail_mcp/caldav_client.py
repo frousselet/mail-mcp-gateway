@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time as _time
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time
 from typing import Any
@@ -161,6 +162,7 @@ class CalDavClient:
         )
         self._home: str = account.discovered_home or ""
         self._calendars: list[CalendarInfo] | None = None
+        self._last_used = 0.0  # read by the registry to close idle clients
 
     async def close(self) -> None:
         await self._client.aclose()
@@ -189,6 +191,7 @@ class CalDavClient:
         # status codes mean), which then answers 200: the write would be
         # reported as done without having happened. Writes do not follow.
         writes = method in ("PUT", "DELETE")
+        self._last_used = _time.time()
         try:
             response = await self._client.request(
                 method,

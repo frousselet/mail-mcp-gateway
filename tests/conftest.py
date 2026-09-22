@@ -21,6 +21,7 @@ os.environ.setdefault("MAIL_LOG_LEVEL", "WARNING")
 _TEST_DATA = Path(tempfile.mkdtemp(prefix="mail-mcp-tests-"))
 os.environ["MAIL_STORE"] = str(_TEST_DATA / "store.json")
 
+import httpx  # noqa: E402
 import pytest  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -65,3 +66,35 @@ def _no_real_credentials(monkeypatch):
     """Never let an ambient mailbox configuration leak into a test."""
     for name in ("MAIL_ADDRESS", "MAIL_PASSWORD", "MAIL_ACCOUNTS_FILE"):
         monkeypatch.delenv(name, raising=False)
+
+
+def session_csrf(client: httpx.AsyncClient) -> str:
+    """The anti-forgery token in a client's session cookie.
+
+    Starlette's session cookie is signed, not encrypted: its first segment is
+    the base64 JSON of the session, which is all a test needs to read.
+    """
+    import base64
+    import json
+
+    cookie = client.cookies.get("mail_mcp_session") or ""
+    payload = cookie.split(".")[0]
+    if not payload:
+        return ""
+    data = json.loads(base64.b64decode(payload + "=" * (-len(payload) % 4)))
+    return data.get("csrf", "")
+
+
+class FormClient(httpx.AsyncClient):
+    """A test client that fills in the form token, as the pages do.
+
+    Every form the UI renders carries it; tests that post forms by hand get it
+    added here, and the tests of the check itself pass ``csrf`` explicitly.
+    """
+
+    async def post(self, url, *args, data=None, **kwargs):
+        if isinstance(data, dict) and "csrf" not in data:
+            if not session_csrf(self):
+                await self.get("/assets/app.css")
+            data = {**data, "csrf": session_csrf(self)}
+        return await super().post(url, *args, data=data, **kwargs)

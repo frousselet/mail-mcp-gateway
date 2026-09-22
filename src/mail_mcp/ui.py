@@ -17,13 +17,33 @@ Two rules hold throughout:
 
 from __future__ import annotations
 
+import contextvars
 import html
+import re
 from typing import Any
 
 from mail_mcp import charts
 from mail_mcp.assets import CSS_VERSION, JS_VERSION
 
 PRODUCT = "Mail MCP Gateway"
+
+# The anti-forgery token of the request being rendered, set by the web app.
+CSRF_TOKEN: contextvars.ContextVar[str] = contextvars.ContextVar("csrf_token", default="")
+_POST_FORM_RE = re.compile(r'(<form\b[^>]*\bmethod="post"[^>]*>)', re.IGNORECASE)
+
+
+def _with_csrf(markup: str) -> str:
+    """Give every POST form on the page the session's anti-forgery token.
+
+    Done once, here, so no form can be written without it. The pattern only
+    ever meets markup this module wrote: interpolated values are escaped, so
+    they cannot contain a literal ``<form``.
+    """
+    token = CSRF_TOKEN.get()
+    if not token:
+        return markup
+    field = f'<input type="hidden" name="csrf" value="{esc(token)}">'
+    return _POST_FORM_RE.sub(lambda match: match.group(1) + field, markup)
 
 
 def esc(value: Any) -> str:
@@ -59,9 +79,9 @@ def page(
 <body{f' data-after="{esc(after)}"' if after else ""}>
 <a class="skip" href="#main">Skip to content</a>
 <div class="shell">
-{nav}
+{_with_csrf(nav)}
 <main id="main">
-{body}
+{_with_csrf(body)}
 </main>
 </div>
 </body></html>"""
@@ -83,7 +103,9 @@ def _header(title: str, email: str = "", current: str = "") -> str:
       {link("/", "Connectors", "connectors")}
       {link("/logs", "Activity", "logs")}
       {link("/account", "Passkeys", "account")}
-      {link("/logout", "Sign out", "logout")}
+      <form method="post" action="/logout" class="inline">
+        <button type="submit" class="linklike">Sign out</button>
+      </form>
     </nav>
     {esc(email)}
   </div>
@@ -536,6 +558,40 @@ def confirm_page(
 </div>
 """
     return page(body, title=title)
+
+
+def logout_page(email: str) -> str:
+    """Signing out is a POST: this is where a plain link to it lands."""
+    body = f"""
+{_header("Sign out", email)}
+<div class="card">
+  <p>Sign out of {esc(email) or "this browser"}? Every other browser signed in to
+  this account is signed out too.</p>
+  <form method="post" action="/logout">
+    <div class="actions">
+      <button type="submit">Sign out</button>
+      <a class="btn secondary" href="/">Stay signed in</a>
+    </div>
+  </form>
+</div>
+"""
+    return page(body, title="Sign out")
+
+
+def expired_page(reason: str) -> str:
+    """A refused form post, with the way back."""
+    body = f"""
+{_header("That did not go through")}
+<div class="card">
+  <p><strong>Nothing was changed.</strong> The request was refused because
+  {esc(reason)}.</p>
+  <p class="muted">This happens when a page stayed open across a sign-in, or when
+  another site tried to act on your behalf. Go back, reload the page and try
+  again.</p>
+  <div class="actions"><a class="btn" href="/">Back to the dashboard</a></div>
+</div>
+"""
+    return page(body, title="Request refused")
 
 
 # ---------------------------------------------------------------------------

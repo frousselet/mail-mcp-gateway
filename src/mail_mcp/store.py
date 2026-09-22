@@ -40,6 +40,7 @@ from mail_mcp.calendars import CalendarAccount, CalendarSet
 logger = logging.getLogger("mail-mcp.store")
 
 DEFAULT_STORE_PATH = "/data/mail_connections.json"
+MAX_CODES_PER_CLIENT = 20
 
 
 # ---------------------------------------------------------------------------
@@ -119,6 +120,7 @@ class OAuthCode:
     code_challenge: str
     scopes: list[str] = field(default_factory=list)
     expires_at: float = 0.0
+    redirect_uri_provided_explicitly: bool = True
 
 
 @dataclass
@@ -145,8 +147,12 @@ class ConnectionStore:
         self._lock = asyncio.Lock()
         self._data: dict[str, Any] = {}
         self._load()
-        for key in ("connections", "users", "credentials", "codes", "tokens", "refresh"):
+        for key in (
+            "connections", "users", "credentials", "codes", "tokens", "refresh",
+            "settings",
+        ):
             self._data.setdefault(key, {})
+        self._migrate()
 
     # --- persistence ---
 
@@ -176,15 +182,39 @@ class ConnectionStore:
             )
             self._data = {}
 
-    def _flush(self) -> None:
+    def _write(self, payload: str) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self._path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(self._data, indent=2))
+        tmp.write_text(payload)
         try:
             tmp.chmod(0o600)
         except OSError:
             pass
         tmp.replace(self._path)
+
+    async def _save(self) -> None:
+        """Write the store, off the event loop.
+
+        Called with the lock held, so writes stay in order; the snapshot is
+        taken before the thread starts, so a later change cannot tear it.
+        """
+        payload = json.dumps(self._data, indent=2)
+        await asyncio.to_thread(self._write, payload)
+
+    def _migrate(self) -> None:
+        """Bring an older store file up to date, once, at start-up."""
+        changed = False
+        for connection in self._data.get("connections", {}).values():
+            for account in connection.get("accounts", {}).values():
+                plain = account.pop("oauth_client_secret", None)
+                if plain:
+                    account["oauth_client_secret_enc"] = self._enc(plain)
+                    changed = True
+                elif plain is not None:
+                    changed = True
+        if changed:
+            self._write(json.dumps(self._data, indent=2))
+            logger.info("Encrypted the OAuth client secrets left in clear in the store.")
 
     def _enc(self, value: str) -> str:
         return self._fernet.encrypt(value.encode()).decode()
@@ -220,6 +250,19 @@ class ConnectionStore:
         """
         return hashlib.sha256(token.encode()).hexdigest()
 
+    # --- deployment settings ---
+
+    def pinned_origin(self) -> str:
+        """The origin passkeys were first used on, when it was not configured."""
+        return str(self._data["settings"].get("origin", ""))
+
+    async def pin_origin(self, origin: str) -> None:
+        async with self._lock:
+            if self._data["settings"].get("origin"):
+                return
+            self._data["settings"]["origin"] = origin
+            await self._save()
+
     # --- connections ---
 
     async def create_connection(self, *, owner_id: str, label: str = "") -> Connection:
@@ -239,14 +282,19 @@ class ConnectionStore:
                 "revision": 0,
             }
             self._data["connections"][connection_id] = record
-            self._flush()
+            await self._save()
             return self._to_connection(record)
 
     def _to_connection(self, record: dict[str, Any]) -> Connection:
         accounts: list[MailAccount] = []
         for account_record in record.get("accounts", {}).values():
             secret = self._dec(account_record.get("secret_enc", ""))
-            accounts.append(MailAccount.from_record(account_record, secret=secret))
+            account = MailAccount.from_record(account_record, secret=secret)
+            if account_record.get("oauth_client_secret_enc"):
+                account.oauth_client_secret = self._dec(
+                    account_record["oauth_client_secret_enc"]
+                )
+            accounts.append(account)
         accounts.sort(key=lambda a: a.created_at)
         calendars: list[CalendarAccount] = []
         for calendar_record in record.get("calendars", {}).values():
@@ -296,11 +344,8 @@ class ConnectionStore:
             if owner_id is not None and record.get("owner_id", "") != owner_id:
                 return False
             self._data["connections"].pop(connection_id, None)
-            client_id = record["client_id"]
-            for token_hash, token_record in list(self._data["tokens"].items()):
-                if token_record.get("client_id") == client_id:
-                    self._data["tokens"].pop(token_hash, None)
-            self._flush()
+            self._drop_client_tokens(record["client_id"])
+            await self._save()
             return True
 
     async def rotate_client_secret(
@@ -315,11 +360,16 @@ class ConnectionStore:
                 return None
             new_secret = secrets.token_urlsafe(32)
             record["client_secret_enc"] = self._enc(new_secret)
-            for token_hash, token_record in list(self._data["tokens"].items()):
-                if token_record.get("client_id") == record["client_id"]:
-                    self._data["tokens"].pop(token_hash, None)
-            self._flush()
+            self._drop_client_tokens(record["client_id"])
+            await self._save()
             return new_secret
+
+    def _drop_client_tokens(self, client_id: str) -> None:
+        """Forget every token and code of one OAuth client (lock held)."""
+        for bucket in ("tokens", "refresh", "codes"):
+            for key, token_record in list(self._data[bucket].items()):
+                if isinstance(token_record, dict) and token_record.get("client_id") == client_id:
+                    self._data[bucket].pop(key, None)
 
     async def rename_connection(
         self, connection_id: str, label: str, owner_id: str | None = None
@@ -331,7 +381,7 @@ class ConnectionStore:
             if owner_id is not None and record.get("owner_id", "") != owner_id:
                 return False
             record["label"] = label
-            self._flush()
+            await self._save()
             return True
 
     # --- mailboxes inside a connection ---
@@ -349,11 +399,13 @@ class ConnectionStore:
             account.created_at = account.created_at or int(time.time())
             stored = account.to_record()
             stored["secret_enc"] = self._enc(account.secret)
+            if account.oauth_client_secret:
+                stored["oauth_client_secret_enc"] = self._enc(account.oauth_client_secret)
             record.setdefault("accounts", {})[account.account_id] = stored
             if not record.get("default_account_id"):
                 record["default_account_id"] = account.account_id
             record["revision"] = record.get("revision", 0) + 1
-            self._flush()
+            await self._save()
             return account
 
     async def remove_account(
@@ -371,7 +423,7 @@ class ConnectionStore:
                 remaining = list(record.get("accounts", {}))
                 record["default_account_id"] = remaining[0] if remaining else ""
             record["revision"] = record.get("revision", 0) + 1
-            self._flush()
+            await self._save()
             return True
 
     async def set_default_account(
@@ -387,7 +439,7 @@ class ConnectionStore:
                 return False
             record["default_account_id"] = account_id
             record["revision"] = record.get("revision", 0) + 1
-            self._flush()
+            await self._save()
             return True
 
     # --- calendars inside a connection ---
@@ -409,7 +461,7 @@ class ConnectionStore:
             if not record.get("default_calendar_id"):
                 record["default_calendar_id"] = calendar.account_id
             record["revision"] = record.get("revision", 0) + 1
-            self._flush()
+            await self._save()
             return calendar
 
     async def remove_calendar(
@@ -427,7 +479,7 @@ class ConnectionStore:
                 remaining = list(record.get("calendars", {}))
                 record["default_calendar_id"] = remaining[0] if remaining else ""
             record["revision"] = record.get("revision", 0) + 1
-            self._flush()
+            await self._save()
             return True
 
     async def set_default_calendar(
@@ -443,7 +495,7 @@ class ConnectionStore:
                 return False
             record["default_calendar_id"] = calendar_id
             record["revision"] = record.get("revision", 0) + 1
-            self._flush()
+            await self._save()
             return True
 
     # --- users and passkeys ---
@@ -458,7 +510,7 @@ class ConnectionStore:
                 "email": email,
                 "created_at": int(time.time()),
             }
-            self._flush()
+            await self._save()
             return user_id
 
     def get_user(self, user_id: str) -> dict[str, Any] | None:
@@ -470,7 +522,7 @@ class ConnectionStore:
             user = self._data["users"].get(user_id)
             if user is not None:
                 user["session_epoch"] = user.get("session_epoch", 0) + 1
-                self._flush()
+                await self._save()
 
     def find_user_by_email(self, email: str) -> str | None:
         for user_id, record in self._data["users"].items():
@@ -496,7 +548,7 @@ class ConnectionStore:
                 "created_at": int(time.time()),
                 "last_used": 0,
             }
-            self._flush()
+            await self._save()
 
     def get_credential(self, credential_id: str) -> dict[str, Any] | None:
         return self._data["credentials"].get(credential_id)
@@ -525,7 +577,7 @@ class ConnectionStore:
             if not remaining:
                 return False
             self._data["credentials"].pop(credential_id, None)
-            self._flush()
+            await self._save()
             return True
 
     async def update_sign_count(self, credential_id: str, sign_count: int) -> None:
@@ -534,31 +586,52 @@ class ConnectionStore:
             if record is not None:
                 record["sign_count"] = sign_count
                 record["last_used"] = int(time.time())
-                self._flush()
+                await self._save()
 
     # --- OAuth codes (stored by hash) ---
 
     async def save_code(self, code: OAuthCode) -> None:
+        """Keep a new authorization code.
+
+        ``/authorize`` needs no session, only a client id, so anyone can make
+        this run. Expired codes are dropped here and each client keeps at most
+        ``MAX_CODES_PER_CLIENT`` pending ones, so the store cannot be grown
+        without bound.
+        """
         async with self._lock:
-            self._data["codes"][self._hash(code.code)] = {
+            codes = self._data["codes"]
+            now = time.time()
+            for key, record in list(codes.items()):
+                if record.get("expires_at", 0) < now:
+                    codes.pop(key, None)
+            mine = sorted(
+                (record.get("expires_at", 0), key)
+                for key, record in codes.items()
+                if record.get("client_id") == code.client_id
+            )
+            for _, key in mine[: max(0, len(mine) - MAX_CODES_PER_CLIENT + 1)]:
+                codes.pop(key, None)
+            codes[self._hash(code.code)] = {
                 "client_id": code.client_id,
                 "redirect_uri": code.redirect_uri,
+                "redirect_uri_provided_explicitly": code.redirect_uri_provided_explicitly,
                 "code_challenge": code.code_challenge,
                 "scopes": code.scopes,
                 "expires_at": code.expires_at,
             }
-            self._flush()
+            await self._save()
 
     def get_code(self, code: str) -> OAuthCode | None:
         record = self._data["codes"].get(self._hash(code))
         if not record:
             return None
-        return OAuthCode(code=code, **record)
+        known = OAuthCode.__dataclass_fields__
+        return OAuthCode(code=code, **{k: v for k, v in record.items() if k in known})
 
     async def pop_code(self, code: str) -> None:
         async with self._lock:
             self._data["codes"].pop(self._hash(code), None)
-            self._flush()
+            await self._save()
 
     # --- OAuth tokens (stored by hash) ---
 
@@ -567,12 +640,19 @@ class ConnectionStore:
         record: OAuthTokenRecord,
         refresh_token: str | None = None,
         refresh_expires_at: float = 0.0,
+        family: str = "",
     ) -> None:
+        """Keep an access token, and the refresh token issued with it.
+
+        ``family`` ties together every token descended from one authorization,
+        so that a replayed refresh token can revoke the whole line.
+        """
         async with self._lock:
             self._data["tokens"][self._hash(record.token)] = {
                 "client_id": record.client_id,
                 "scopes": record.scopes,
                 "expires_at": record.expires_at,
+                "family": family,
             }
             if refresh_token:
                 # The refresh token carries its own client and scopes. It used
@@ -584,21 +664,32 @@ class ConnectionStore:
                     "scopes": record.scopes,
                     "expires_at": refresh_expires_at,
                     "access_hash": self._hash(record.token),
+                    "family": family,
                 }
-            self._flush()
+            await self._save()
 
     def get_token(self, token: str) -> OAuthTokenRecord | None:
         record = self._data["tokens"].get(self._hash(token))
         if not record:
             return None
-        return OAuthTokenRecord(token=token, **record)
+        return OAuthTokenRecord(
+            token=token,
+            client_id=record.get("client_id", ""),
+            scopes=record.get("scopes", []),
+            expires_at=record.get("expires_at", 0.0),
+        )
 
     def get_token_by_hash(self, token_hash: str) -> OAuthTokenRecord | None:
         record = self._data["tokens"].get(token_hash)
         if not record:
             return None
         # Only the hash is stored, so the raw token is unknown here.
-        return OAuthTokenRecord(token="", **record)
+        return OAuthTokenRecord(
+            token="",
+            client_id=record.get("client_id", ""),
+            scopes=record.get("scopes", []),
+            expires_at=record.get("expires_at", 0.0),
+        )
 
     def get_refresh(self, refresh_token: str) -> OAuthTokenRecord | None:
         """The connector and scopes behind a refresh token, if it is still live."""
@@ -609,7 +700,9 @@ class ConnectionStore:
             pointed = self._data["tokens"].get(record)
             if not pointed:
                 return None
-            return OAuthTokenRecord(token="", **pointed)
+            return self.get_token_by_hash(record)
+        if record.get("consumed_at"):
+            return None
         if record.get("expires_at") and record["expires_at"] < time.time():
             return None
         return OAuthTokenRecord(
@@ -626,6 +719,46 @@ class ConnectionStore:
             return record
         return record.get("access_hash") if record else None
 
+    def refresh_family(self, refresh_token: str) -> str:
+        record = self._data["refresh"].get(self._hash(refresh_token))
+        return record.get("family", "") if isinstance(record, dict) else ""
+
+    def refresh_was_used(self, refresh_token: str) -> dict[str, Any] | None:
+        """The record of a refresh token that was already exchanged, if it was."""
+        record = self._data["refresh"].get(self._hash(refresh_token))
+        if isinstance(record, dict) and record.get("consumed_at"):
+            return record
+        return None
+
+    async def consume_refresh(self, refresh_token: str) -> None:
+        """Retire a refresh token after use, but remember it was used.
+
+        Deleting it would make a replay look like any unknown token. Kept as
+        consumed, a second presentation is recognised as the theft it is.
+        """
+        async with self._lock:
+            record = self._data["refresh"].get(self._hash(refresh_token))
+            if isinstance(record, dict):
+                self._data["tokens"].pop(record.get("access_hash", ""), None)
+                record["consumed_at"] = time.time()
+            else:
+                self._data["refresh"].pop(self._hash(refresh_token), None)
+            await self._save()
+
+    async def revoke_family(self, family: str) -> int:
+        """Revoke every token descended from one authorization."""
+        if not family:
+            return 0
+        async with self._lock:
+            removed = 0
+            for bucket in ("tokens", "refresh"):
+                for key, record in list(self._data[bucket].items()):
+                    if isinstance(record, dict) and record.get("family") == family:
+                        self._data[bucket].pop(key, None)
+                        removed += 1
+            await self._save()
+            return removed
+
     async def expire_access(self, token: str) -> None:
         """Drop one access token that has timed out, and nothing else.
 
@@ -634,7 +767,7 @@ class ConnectionStore:
         """
         async with self._lock:
             self._data["tokens"].pop(self._hash(token), None)
-            self._flush()
+            await self._save()
 
     async def revoke(self, token: str) -> None:
         """Revoke a token the client asked to revoke, and what hangs off it."""
@@ -648,20 +781,27 @@ class ConnectionStore:
                 pointed = record if isinstance(record, str) else record.get("access_hash")
                 if pointed == token_hash:
                     self._data["refresh"].pop(refresh_hash, None)
-            self._flush()
+            await self._save()
 
     async def purge_expired(self) -> int:
-        """Drop expired codes and access tokens; returns how many were removed."""
+        """Drop expired codes and tokens; returns how many were removed.
+
+        Consumed refresh tokens stay until they would have expired anyway: up
+        to then, a replay of one must still be recognised.
+        """
         async with self._lock:
             now = time.time()
             removed = 0
-            for bucket in ("codes", "tokens"):
+            for bucket in ("codes", "tokens", "refresh"):
                 for key, record in list(self._data[bucket].items()):
-                    if record.get("expires_at", 0) < now:
+                    if not isinstance(record, dict):
+                        continue
+                    expires = record.get("expires_at", 0)
+                    if expires and expires < now:
                         self._data[bucket].pop(key, None)
                         removed += 1
             if removed:
-                self._flush()
+                await self._save()
             return removed
 
 
@@ -678,6 +818,9 @@ class _RegistryEntry:
     clients: dict[str, Any] = field(default_factory=dict)
 
 
+IDLE_SECONDS = 15 * 60
+
+
 class MailboxRegistry:
     """Keeps the live clients (IMAP and CalDAV) of one connection.
 
@@ -692,17 +835,58 @@ class MailboxRegistry:
         # collected mid-flight.
         self._closing: set[asyncio.Task[None]] = set()
 
+    def _close_later(self, clients: dict[str, Any]) -> None:
+        if not clients:
+            return
+        task = asyncio.get_event_loop().create_task(_close_clients(dict(clients)))
+        clients.clear()
+        self._closing.add(task)
+        task.add_done_callback(self._closing.discard)
+
+    def forget(self, client_id: str) -> None:
+        """Drop a connection's live clients now: it was deleted or re-keyed.
+
+        Access is refused anyway once the connection is gone; this closes the
+        authenticated IMAP sessions and CalDAV pools it still held open, and
+        drops the decrypted credentials from memory.
+        """
+        entry = self._entries.pop(client_id, None)
+        if entry is not None:
+            self._close_later(entry.clients)
+
+    async def reap_idle(self, idle_seconds: float = IDLE_SECONDS) -> int:
+        """Close the connections nobody has used for a while.
+
+        Also drops entries whose connection was deleted without going through
+        :meth:`forget` (another process, a restored store file).
+        """
+        closed = 0
+        now = time.time()
+        for client_id, entry in list(self._entries.items()):
+            if self._store.get_connection_by_client_id(client_id) is None:
+                self.forget(client_id)
+                continue
+            for key, client in list(entry.clients.items()):
+                last = getattr(client, "_last_used", 0.0) or 0.0
+                if last and now - last > idle_seconds:
+                    entry.clients.pop(key, None)
+                    try:
+                        await client.close()
+                    except Exception:
+                        pass
+                    closed += 1
+        return closed
+
     def _entry(self, client_id: str) -> _RegistryEntry | None:
         connection = self._store.get_connection_by_client_id(client_id)
         if connection is None:
+            self.forget(client_id)
             return None
         cached = self._entries.get(client_id)
         if cached is not None and cached.revision == connection.revision:
             return cached
         if cached is not None:
-            task = asyncio.get_event_loop().create_task(_close_clients(cached.clients))
-            self._closing.add(task)
-            task.add_done_callback(self._closing.discard)
+            self._close_later(cached.clients)
         entry = _RegistryEntry(
             revision=connection.revision,
             accounts=connection.account_set(),

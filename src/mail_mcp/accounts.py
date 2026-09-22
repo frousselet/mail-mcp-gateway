@@ -184,7 +184,8 @@ class MailAccount:
         record = {
             k: v
             for k, v in self.__dict__.items()
-            if not k.startswith("_") and k != "secret"
+            # Both credentials are sealed by the store, never written as is.
+            if not k.startswith("_") and k not in ("secret", "oauth_client_secret")
         }
         return record
 

@@ -56,8 +56,10 @@ def _redirect_uris() -> list[str]:
 class MailOAuthProvider(
     OAuthAuthorizationServerProvider[AuthorizationCode, RefreshToken, AccessToken]
 ):
-    def __init__(self, store: ConnectionStore):
+    def __init__(self, store: ConnectionStore, on_reuse=None):
         self._store = store
+        # Told about a replayed refresh token, so it shows in the activity log.
+        self._on_reuse = on_reuse
 
     # --- clients ---
 
@@ -94,6 +96,9 @@ class MailOAuthProvider(
                 code_challenge=params.code_challenge,
                 scopes=params.scopes or [SCOPE],
                 expires_at=time.time() + CODE_TTL,
+                # RFC 6749 4.1.3: the token request must repeat redirect_uri
+                # only if the authorization request carried it.
+                redirect_uri_provided_explicitly=params.redirect_uri_provided_explicitly,
             )
         )
         return construct_redirect_uri(
@@ -116,20 +121,27 @@ class MailOAuthProvider(
             client_id=record.client_id,
             code_challenge=record.code_challenge,
             redirect_uri=record.redirect_uri,  # type: ignore[arg-type]
-            redirect_uri_provided_explicitly=True,
+            redirect_uri_provided_explicitly=record.redirect_uri_provided_explicitly,
         )
 
     async def exchange_authorization_code(
         self, client: OAuthClientInformationFull, authorization_code: AuthorizationCode
     ) -> OAuthToken:
         await self._store.pop_code(authorization_code.code)
-        return await self._issue_tokens(client.client_id, authorization_code.scopes)
+        # A new authorization starts a new family of tokens.
+        return await self._issue_tokens(
+            client.client_id, authorization_code.scopes, family=secrets.token_hex(8)
+        )
 
     # --- refresh tokens ---
 
     async def load_refresh_token(
         self, client: OAuthClientInformationFull, refresh_token: str
     ) -> RefreshToken | None:
+        used = self._store.refresh_was_used(refresh_token)
+        if used is not None:
+            await self._reuse_detected(client.client_id, used.get("family", ""))
+            return None
         record = self._store.get_refresh(refresh_token)
         if record is None or record.client_id != client.client_id:
             return None
@@ -143,13 +155,33 @@ class MailOAuthProvider(
         refresh_token: RefreshToken,
         scopes: list[str],
     ) -> OAuthToken:
-        # Rotate: drop the access token behind this refresh token, and the
-        # refresh token itself (both are stored only as hashes).
-        old_access_hash = self._store.get_refresh_access_hash(refresh_token.token)
-        if old_access_hash:
-            await self._store.revoke_hash(old_access_hash)
-        await self._store.revoke(refresh_token.token)
-        return await self._issue_tokens(client.client_id, scopes or refresh_token.scopes)
+        # Rotate: the access token behind this refresh token goes, and the
+        # refresh token is retired but remembered, so a replay of it is caught.
+        family = self._store.refresh_family(refresh_token.token) or secrets.token_hex(8)
+        await self._store.consume_refresh(refresh_token.token)
+        return await self._issue_tokens(
+            client.client_id, scopes or refresh_token.scopes, family=family
+        )
+
+    async def _reuse_detected(self, client_id: str, family: str) -> None:
+        """A refresh token came back after it was exchanged.
+
+        Either the client replayed it by mistake or someone else holds a copy.
+        The two cannot be told apart, so the whole line of tokens is revoked
+        (RFC 9700 4.14.2): the rightful client re-authorizes, a thief is out.
+        """
+        revoked = await self._store.revoke_family(family)
+        logger.warning(
+            "A refresh token of %s was used twice; revoked %d token(s) issued "
+            "from the same authorization.",
+            client_id,
+            revoked,
+        )
+        if self._on_reuse is not None:
+            try:
+                self._on_reuse(client_id)
+            except Exception:
+                logger.exception("Could not record the refresh token reuse")
 
     # --- access tokens ---
 
@@ -174,7 +206,9 @@ class MailOAuthProvider(
 
     # --- helpers ---
 
-    async def _issue_tokens(self, client_id: str, scopes: list[str]) -> OAuthToken:
+    async def _issue_tokens(
+        self, client_id: str, scopes: list[str], family: str = ""
+    ) -> OAuthToken:
         access = "at_" + secrets.token_urlsafe(32)
         refresh = "rt_" + secrets.token_urlsafe(32)
         now = time.time()
@@ -187,6 +221,7 @@ class MailOAuthProvider(
             ),
             refresh_token=refresh,
             refresh_expires_at=now + REFRESH_TTL,
+            family=family,
         )
         return OAuthToken(
             access_token=access,

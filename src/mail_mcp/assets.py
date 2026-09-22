@@ -104,6 +104,12 @@ hr { border: 0; border-top: 1px solid var(--border); margin: var(--s5) 0; }
 .top .who { color: var(--muted); font-size: var(--fs-md); }
 nav.main { display: flex; gap: var(--s3); flex-wrap: wrap; align-items: baseline; }
 nav.main a[aria-current="page"] { font-weight: 600; color: var(--text); text-decoration: none; }
+form.inline { display: inline; margin: 0; }
+button.linklike {
+  background: none; border: 0; padding: 0; min-height: 0; font: inherit;
+  color: var(--accent); text-decoration: underline; cursor: pointer;
+}
+button.linklike:hover { background: none; color: var(--accent-hover); }
 
 /* -------------------------------------------------------------- buttons */
 button, .btn {

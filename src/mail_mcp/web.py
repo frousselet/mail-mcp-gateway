@@ -24,6 +24,9 @@ derived from the request and the encryption key is generated on first run, so
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
+import hmac
 import json as jsonlib
 import logging
 import os
@@ -108,15 +111,32 @@ def _store():
     return server.STORE
 
 
-def _base_url(request: Request) -> str:
-    """The public base URL, derived from the request (honouring proxies).
+def _forget(client_id: str) -> None:
+    if server.REGISTRY is not None:
+        server.REGISTRY.forget(client_id)
 
-    ``MAIL_PUBLIC_URL`` overrides the detection; setting it is recommended in
-    production so the OAuth metadata matches exactly.
+
+def _base_url(request: Request) -> str:
+    """The public base URL: configured, pinned, or (first time only) derived.
+
+    Passkeys are bound to this origin, so it must not come from whoever sends
+    the request: a look-alike domain proxying to the gateway would otherwise
+    get ceremonies issued for itself. ``MAIL_PUBLIC_URL`` decides when set.
+    Without it, the origin of the first successful passkey ceremony is
+    pinned in the store and used from then on.
     """
     configured = os.environ.get("MAIL_PUBLIC_URL")
     if configured:
         return configured.rstrip("/")
+    store = _store()
+    pinned = store.pinned_origin() if store is not None else ""
+    if pinned:
+        return pinned
+    return _derived_base_url(request)
+
+
+def _derived_base_url(request: Request) -> str:
+    """What the request says the public URL is (honouring proxies)."""
     proto = request.headers.get("x-forwarded-proto") or request.url.scheme
     host = (
         request.headers.get("x-forwarded-host")
@@ -128,6 +148,102 @@ def _base_url(request: Request) -> str:
 
 def _rp_id(request: Request) -> str:
     return urlparse(_base_url(request)).hostname or "localhost"
+
+
+async def _pin_origin(request: Request) -> None:
+    """Remember the origin a passkey ceremony just succeeded on."""
+    store = _store()
+    if store is None or os.environ.get("MAIL_PUBLIC_URL") or store.pinned_origin():
+        return
+    origin = _derived_base_url(request)
+    await store.pin_origin(origin)
+    logger.info(
+        "Passkeys are now bound to %s. Set MAIL_PUBLIC_URL to change it.", origin
+    )
+
+
+# ---------------------------------------------------------------------------
+# Cross-site request forgery
+# ---------------------------------------------------------------------------
+
+# Paths machines post to (the MCP client, the OAuth token endpoint): they carry
+# their own credentials and no browser cookie, so the browser checks below do
+# not apply.
+_MACHINE_PATHS = ("/mcp", "/token", "/revoke")
+_BODY_TYPES = (
+    "application/x-www-form-urlencoded",
+    "multipart/form-data",
+    "application/json",
+)
+
+
+class BrowserGuard:
+    """Refuse state-changing requests that a browser did not send from here.
+
+    Three layers, cheapest first: a request a browser marks as coming from
+    another site (``Sec-Fetch-Site``) or another origin (``Origin``) is
+    refused; a body type other than the two form encodings and JSON is
+    refused (so a JSON endpoint cannot be reached with a ``text/plain`` form,
+    which needs no preflight); and every HTML form carries a per-session
+    token that its handler checks (see :func:`_form`). SameSite=Lax alone
+    lets a sibling subdomain through, which is why.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        session = scope.get("session")
+        if isinstance(session, dict):
+            token = session.get("csrf")
+            if not token:
+                token = session["csrf"] = secrets.token_urlsafe(24)
+            ui.CSRF_TOKEN.set(token)
+        path = scope.get("path", "")
+        machine = path.startswith(_MACHINE_PATHS)
+        if scope["method"] in ("POST", "PUT", "PATCH", "DELETE") and not machine:
+            problem = self._problem(Request(scope))
+            if problem:
+                logger.warning("Refused %s %s: %s", scope["method"], path, problem)
+                response = HTMLResponse(ui.expired_page(problem), status_code=403)
+                await response(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
+
+    @staticmethod
+    def _problem(request: Request) -> str:
+        site = request.headers.get("sec-fetch-site", "")
+        if site and site not in ("same-origin", "none"):
+            return f"the request came from another site ({site})"
+        origin = request.headers.get("origin", "")
+        if origin and origin != "null":
+            allowed = {_base_url(request).rstrip("/"), _derived_base_url(request)}
+            if origin.rstrip("/") not in allowed:
+                return "the request came from another origin"
+        content_type = request.headers.get("content-type", "").split(";")[0].strip()
+        if content_type and content_type.lower() not in _BODY_TYPES:
+            return f"unexpected body type {content_type}"
+        return ""
+
+
+async def _form(request: Request):
+    """The posted form, or None when its anti-forgery token is wrong."""
+    form = await request.form()
+    expected = request.session.get("csrf", "")
+    supplied = str(form.get("csrf", ""))
+    if not expected or not hmac.compare_digest(supplied, expected):
+        logger.warning(
+            "Refused a form post to %s: bad or missing token", request.url.path
+        )
+        return None
+    return form
+
+
+def _expired() -> HTMLResponse:
+    return HTMLResponse(ui.expired_page("the form was out of date"), status_code=403)
 
 
 def _uid(request: Request) -> str | None:
@@ -347,6 +463,7 @@ async def register_complete(request: Request) -> JSONResponse:
     request.session["uid"] = uid
     request.session["email"] = email
     request.session["epoch"] = (store.get_user(uid) or {}).get("session_epoch", 0)
+    await _pin_origin(request)
     logger.info("Registered a passkey for %s", email)
     return JSONResponse({"ok": True})
 
@@ -406,6 +523,7 @@ async def login_complete(request: Request) -> JSONResponse:
     request.session["uid"] = record["user_id"]
     request.session["email"] = user["email"] if user else ""
     request.session["epoch"] = (user or {}).get("session_epoch", 0)
+    await _pin_origin(request)
     return JSONResponse({"ok": True})
 
 
@@ -445,7 +563,9 @@ async def passkey_delete(request: Request) -> Response:
     if not uid:
         return RedirectResponse("/login", status_code=303)
     store = _store()
-    form = await request.form()
+    form = await _form(request)
+    if form is None:
+        return _expired()
     credential_id = str(form.get("credential_id", ""))
     if store and credential_id:
         await store.delete_credential(uid, credential_id)
@@ -453,7 +573,15 @@ async def passkey_delete(request: Request) -> Response:
 
 
 @mcp.custom_route("/logout", methods=["GET"])
-async def logout(request: Request) -> RedirectResponse:
+async def logout_page(request: Request) -> Response:
+    """Signing out changes state, so a link only leads to the button."""
+    if not _uid(request):
+        return RedirectResponse("/login", status_code=303)
+    return HTMLResponse(ui.logout_page(request.session.get("email", "")))
+
+
+@mcp.custom_route("/logout", methods=["POST"])
+async def logout(request: Request) -> Response:
     """Sign out, and make the cookie that was just dropped useless.
 
     Clearing the session only tells this browser to forget it. The cookie is
@@ -461,6 +589,8 @@ async def logout(request: Request) -> RedirectResponse:
     for its full lifetime; bumping the user's epoch retires every cookie
     issued before now.
     """
+    if await _form(request) is None:
+        return _expired()
     store = _store()
     uid = _uid(request)
     if store and uid:
@@ -490,7 +620,9 @@ async def connection_new(request: Request) -> Response:
     if store is None:
         return HTMLResponse(ui.page("Server misconfigured."), status_code=500)
 
-    form = await request.form()
+    form = await _form(request)
+    if form is None:
+        return _expired()
     gate = os.environ.get("MAIL_ONBOARD_CODE")
     if gate and str(form.get("onboard_code", "")) != gate:
         return _dashboard(request, error="Invalid invite code.")
@@ -566,12 +698,18 @@ async def connection_delete(request: Request) -> Response:
     if not uid:
         return RedirectResponse("/login", status_code=303)
     store = _store()
-    form = await request.form()
+    form = await _form(request)
+    if form is None:
+        return _expired()
     if str(form.get("confirm", "")) != "yes":
         return _dashboard(request, error="That delete was not confirmed.")
     connection_id = str(form.get("connection_id", ""))
     if store and connection_id:
+        existing = store.get_connection(connection_id)
         ok = await store.delete_connection(connection_id, owner_id=uid)
+        if ok and existing is not None:
+            # Close its open IMAP and CalDAV sessions now, not at restart.
+            _forget(existing.client_id)
         logger.info("User %s deleted connector %s (ok=%s)", uid, connection_id, ok)
     return _redirect("/", "connector_deleted")
 
@@ -608,7 +746,9 @@ async def connection_rotate(request: Request) -> Response:
     if not uid:
         return RedirectResponse("/login", status_code=303)
     store = _store()
-    form = await request.form()
+    form = await _form(request)
+    if form is None:
+        return _expired()
     if str(form.get("confirm", "")) != "yes":
         return _dashboard(request, error="That rotation was not confirmed.")
     connection_id = str(form.get("connection_id", ""))
@@ -617,6 +757,9 @@ async def connection_rotate(request: Request) -> Response:
     secret = await store.rotate_client_secret(connection_id, owner_id=uid)
     if secret is None:
         return _dashboard(request, error="That connector no longer exists.")
+    existing = store.get_connection(connection_id)
+    if existing is not None:
+        _forget(existing.client_id)
     return RedirectResponse(
         f"/connections/{connection_id}/credentials", status_code=303
     )
@@ -696,7 +839,9 @@ async def mailbox_add(request: Request) -> Response:
     view = _connection_view(
         connection, _base_url(request), email=request.session.get("email", "")
     )
-    form = await request.form()
+    form = await _form(request)
+    if form is None:
+        return _expired()
     # Everything but the password is handed back, so a wrong app password costs
     # one field, not the whole form (WCAG 3.3.7).
     typed = {key: value for key, value in form.items() if key != "secret"}
@@ -763,7 +908,9 @@ async def mailbox_delete(request: Request) -> Response:
     if not uid:
         return RedirectResponse("/login", status_code=303)
     store = _store()
-    form = await request.form()
+    form = await _form(request)
+    if form is None:
+        return _expired()
     if str(form.get("confirm", "")) != "yes":
         return _dashboard(request, error="That removal was not confirmed.")
     connection_id = str(form.get("connection_id", ""))
@@ -779,7 +926,9 @@ async def mailbox_default(request: Request) -> Response:
     if not uid:
         return RedirectResponse("/login", status_code=303)
     store = _store()
-    form = await request.form()
+    form = await _form(request)
+    if form is None:
+        return _expired()
     connection_id = str(form.get("connection_id", ""))
     account_id = str(form.get("account_id", ""))
     if store and connection_id and account_id:
@@ -793,7 +942,9 @@ async def calendar_default(request: Request) -> Response:
     if not uid:
         return RedirectResponse("/login", status_code=303)
     store = _store()
-    form = await request.form()
+    form = await _form(request)
+    if form is None:
+        return _expired()
     connection_id = str(form.get("connection_id", ""))
     calendar_id = str(form.get("calendar_id", ""))
     if store and connection_id and calendar_id:
@@ -881,7 +1032,9 @@ async def calendar_add(request: Request) -> Response:
     view = _connection_view(
         connection, _base_url(request), email=request.session.get("email", "")
     )
-    form = await request.form()
+    form = await _form(request)
+    if form is None:
+        return _expired()
     typed = {key: value for key, value in form.items() if key != "secret"}
     calendar = _calendar_from_form(form)
     try:
@@ -947,7 +1100,9 @@ async def calendar_delete(request: Request) -> Response:
     if not uid:
         return RedirectResponse("/login", status_code=303)
     store = _store()
-    form = await request.form()
+    form = await _form(request)
+    if form is None:
+        return _expired()
     if str(form.get("confirm", "")) != "yes":
         return _dashboard(request, error="That removal was not confirmed.")
     connection_id = str(form.get("connection_id", ""))
@@ -1009,16 +1164,24 @@ async def logs(request: Request) -> Response:
     }
 
     log = server.ACTIVITY
-    overview = activity.overview(log, uid)
-    entries = log.read(
-        owner_id=uid,
-        connection_id=filters["connection_id"] or None,
-        account=filters["account"] or None,
-        tool=filters["tool"] or None,
-        status=filters["status"] or None,
-        limit=limit,
-    )
-    stats = log.stats(owner_id=uid)
+
+    def _gather():
+        # One read of the file, off the event loop, for all three views.
+        everything = log.read(owner_id=uid, limit=log.capacity)
+        return (
+            activity.overview(log, uid, entries=everything),
+            activity.select(
+                everything,
+                connection_id=filters["connection_id"] or None,
+                account=filters["account"] or None,
+                tool=filters["tool"] or None,
+                status=filters["status"] or None,
+                limit=limit,
+            ),
+            activity.stats_of(everything),
+        )
+
+    overview, entries, stats = await asyncio.to_thread(_gather)
     store = _store()
     connections = [
         (connection.connection_id, connection.label or connection.connection_id)
@@ -1212,6 +1375,51 @@ class SecurityHeaders:
         await self.app(scope, receive, send_with_headers)
 
 
+MAINTENANCE_SECONDS = 300
+
+
+async def _maintenance() -> None:
+    """Housekeeping while the app runs.
+
+    Expired authorization codes and tokens are dropped (``/authorize`` needs
+    no session, so abandoned codes would otherwise pile up), and mailbox
+    connections nobody used for a while are closed.
+    """
+    while True:
+        try:
+            if server.STORE is not None:
+                removed = await server.STORE.purge_expired()
+                if removed:
+                    logger.info("Purged %d expired code(s) and token(s)", removed)
+            if server.REGISTRY is not None:
+                closed = await server.REGISTRY.reap_idle()
+                if closed:
+                    logger.info("Closed %d idle mailbox connection(s)", closed)
+        except Exception:
+            logger.exception("Housekeeping failed; trying again later")
+        await asyncio.sleep(MAINTENANCE_SECONDS)
+
+
+def _with_housekeeping(app) -> None:
+    """Run :func:`_maintenance` for the app's lifetime, close clients at the end."""
+    inner = app.router.lifespan_context
+
+    @contextlib.asynccontextmanager
+    async def lifespan(scope_app):
+        async with inner(scope_app) as state:
+            task = asyncio.create_task(_maintenance())
+            try:
+                yield state
+            finally:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+                if server.REGISTRY is not None:
+                    await server.REGISTRY.aclose()
+
+    app.router.lifespan_context = lifespan
+
+
 def build_app():
     if server.STORE is None:  # pragma: no cover - import-order guard
         raise RuntimeError(
@@ -1220,6 +1428,7 @@ def build_app():
             "or set MAIL_MULTITENANT=1 in the environment."
         )
     app = mcp.streamable_http_app(transport_security=server.transport_security())
+    _with_housekeeping(app)
 
     # Shadow the SDK's fixed-issuer metadata with request-derived versions
     # (matched first because they are inserted at the front of the route list).
@@ -1240,6 +1449,8 @@ def build_app():
         ),
     )
 
+    # Innermost first: the guard reads the session the middleware decoded.
+    app.add_middleware(BrowserGuard)
     app.add_middleware(
         SessionMiddleware,
         secret_key=_session_secret(),

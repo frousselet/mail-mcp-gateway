@@ -7,6 +7,7 @@ import re
 import httpx
 import pytest
 from asgi_lifespan import LifespanManager
+from conftest import FormClient
 
 from mail_mcp import server, web
 from mail_mcp.caldav_client import CalDavClient
@@ -33,7 +34,7 @@ async def client(monkeypatch):
     monkeypatch.setattr(web, "_uid", lambda request: USER_ID)
     async with LifespanManager(web.build_app()) as manager:
         transport = httpx.ASGITransport(app=manager.app)
-        async with httpx.AsyncClient(
+        async with FormClient(
             transport=transport, base_url="https://gateway.test", follow_redirects=False
         ) as http:
             yield http

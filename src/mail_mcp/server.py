@@ -11,6 +11,7 @@ Two deployment modes share the same tool set:
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import logging
@@ -21,6 +22,7 @@ from datetime import time as dtime
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from mcp.server.auth.middleware.auth_context import get_access_token
 from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions
@@ -263,7 +265,29 @@ async def _activity_middleware(ctx, call_next):
         raise
     finally:
         entry.duration_ms = int((time.perf_counter() - started) * 1000)
-        ACTIVITY.append(entry)
+        # A file write, sometimes a trim of the whole file: not on the loop.
+        await asyncio.to_thread(ACTIVITY.append, entry)
+
+
+def _record_refresh_reuse(client_id: str) -> None:
+    """Put a replayed refresh token in the owner's activity log."""
+    entry = ActivityEntry(
+        ts=time.time(),
+        tool="oauth: refresh token reused",
+        status="denied",
+        detail=(
+            "A refresh token was presented a second time. Every token of that "
+            "authorization was revoked; the connector must be authorized again. "
+            "If you did not cause this, rotate the connector's secret."
+        ),
+    )
+    if STORE is not None:
+        connection = STORE.get_connection_by_client_id(client_id)
+        if connection is not None:
+            entry.connection_id = connection.connection_id
+            entry.connection_label = connection.label
+            entry.owner_id = connection.owner_id
+    ACTIVITY.append(entry)
 
 
 def _build_mcp() -> MCPServer:
@@ -279,7 +303,7 @@ def _build_mcp() -> MCPServer:
         global STORE, REGISTRY, OAUTH_PROVIDER
         STORE = ConnectionStore()
         REGISTRY = MailboxRegistry(STORE)
-        OAUTH_PROVIDER = MailOAuthProvider(STORE)
+        OAUTH_PROVIDER = MailOAuthProvider(STORE, on_reuse=_record_refresh_reuse)
 
         # Startup fallback only: the web app serves request-derived metadata.
         public_url = (
@@ -313,6 +337,15 @@ def transport_security() -> TransportSecuritySettings:
         for host in os.environ.get("MAIL_ALLOWED_HOSTS", "").split(",")
         if host.strip()
     ]
+    public = urlsplit(os.environ.get("MAIL_PUBLIC_URL", "")).netloc
+    if not allowed and not _MULTITENANT:
+        # Single-mailbox HTTP has no OAuth in front of it: without this check
+        # any web page the owner visits could reach it by DNS rebinding.
+        allowed = ["localhost:*", "127.0.0.1:*", "[::1]:*"]
+    if not allowed and public:
+        # A public URL says which host the endpoint answers to: check it, and
+        # keep the container's own name for the health check.
+        allowed = [public, "localhost:*", "127.0.0.1:*"]
     if allowed:
         return TransportSecuritySettings(
             enable_dns_rebinding_protection=True,
@@ -2125,6 +2158,30 @@ def _free_slots(
 # ---------------------------------------------------------------------------
 
 
+def _unprotected_http(host: str) -> str:
+    """Why this HTTP server must not start, or "" when it may.
+
+    Single-mailbox mode has no OAuth: whoever reaches the port reads the mail
+    and sends as the owner. Listening beyond this machine therefore takes an
+    explicit MAIL_INSECURE_HTTP=1.
+    """
+    if _MULTITENANT or host in ("127.0.0.1", "localhost", "::1"):
+        return ""
+    if _bool_env("MAIL_INSECURE_HTTP"):
+        logger.warning(
+            "Serving one mailbox over HTTP on %s with NO authentication "
+            "(MAIL_INSECURE_HTTP=1). Keep that port away from any network.",
+            host,
+        )
+        return ""
+    return (
+        f"Refusing to serve a mailbox over HTTP on {host} without authentication: "
+        "anyone who can reach the port could read the mail and send as its owner. "
+        "Bind to 127.0.0.1, use the multi-user gateway (mail-mcp-web), which "
+        "requires OAuth, or set MAIL_INSECURE_HTTP=1 if something else guards it."
+    )
+
+
 def main() -> None:
     """Run the MCP server standalone (stdio by default)."""
     import argparse
@@ -2137,7 +2194,7 @@ def main() -> None:
         help="Transport protocol (default: stdio)",
     )
     parser.add_argument(
-        "--host", default="0.0.0.0", help="Bind address for HTTP transports"
+        "--host", default="127.0.0.1", help="Bind address for HTTP transports"
     )
     parser.add_argument(
         "--port", type=int, default=8000, help="Port for HTTP transports"
@@ -2147,6 +2204,9 @@ def main() -> None:
     if args.transport == "stdio":
         mcp.run(transport="stdio")
         return
+    problem = _unprotected_http(args.host)
+    if problem:
+        sys.exit(problem)
     mcp.run(
         transport=args.transport,
         host=args.host,

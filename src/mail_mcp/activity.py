@@ -154,6 +154,11 @@ class ActivityLog:
     def path(self) -> Path:
         return self._path
 
+    @property
+    def capacity(self) -> int:
+        """How many entries the log keeps at most (1 when it is off)."""
+        return self._max_entries or 1
+
     def append(self, entry: ActivityEntry) -> None:
         """Write one entry. Never raises: logging must not break a tool call."""
         if not self.enabled:
@@ -233,15 +238,45 @@ class ActivityLog:
 
     def stats(self, owner_id: str | None = None) -> dict[str, Any]:
         """Counts for the header of the logs page."""
-        entries = self.read(owner_id=owner_id, limit=self._max_entries or 1)
-        day_ago = time.time() - 86400
-        return {
-            "total": len(entries),
-            "errors": sum(1 for e in entries if e.status != "ok"),
-            "last_24h": sum(1 for e in entries if e.ts >= day_ago),
-            "tools": sorted({e.tool for e in entries}),
-            "accounts": sorted({e.account for e in entries if e.account}),
-        }
+        return stats_of(self.read(owner_id=owner_id, limit=self.capacity))
+
+
+def stats_of(entries: list[ActivityEntry]) -> dict[str, Any]:
+    """Counts over entries already read, so a page reads the file once."""
+    day_ago = time.time() - 86400
+    return {
+        "total": len(entries),
+        "errors": sum(1 for e in entries if e.status != "ok"),
+        "last_24h": sum(1 for e in entries if e.ts >= day_ago),
+        "tools": sorted({e.tool for e in entries}),
+        "accounts": sorted({e.account for e in entries if e.account}),
+    }
+
+
+def select(
+    entries: list[ActivityEntry],
+    *,
+    connection_id: str | None = None,
+    account: str | None = None,
+    tool: str | None = None,
+    status: str | None = None,
+    limit: int = 200,
+) -> list[ActivityEntry]:
+    """Filter entries already read (most recent first), like ``read`` does."""
+    out: list[ActivityEntry] = []
+    for entry in entries:
+        if connection_id and entry.connection_id != connection_id:
+            continue
+        if account and entry.account != account:
+            continue
+        if tool and entry.tool != tool:
+            continue
+        if status and entry.status != status:
+            continue
+        out.append(entry)
+        if len(out) >= max(1, limit):
+            break
+    return out
 
 
 def _default_path() -> str:
@@ -268,9 +303,17 @@ class Overview:
 
 
 def overview(
-    log: ActivityLog, owner_id: str, *, days: int = 14, now: float | None = None
+    log: ActivityLog,
+    owner_id: str,
+    *,
+    days: int = 14,
+    now: float | None = None,
+    entries: list[ActivityEntry] | None = None,
 ) -> Overview:
-    """Aggregate this owner's activity over the last ``days`` days."""
+    """Aggregate this owner's activity over the last ``days`` days.
+
+    ``entries`` spares a second read when the caller already has them.
+    """
     import datetime as _dt
 
     moment = now if now is not None else time.time()
@@ -288,7 +331,9 @@ def overview(
     total = failed = last_24h = 0
     day_ago = moment - 86400
 
-    for entry in log.read(owner_id=owner_id, limit=log._max_entries or 1):
+    if entries is None:
+        entries = log.read(owner_id=owner_id, limit=log.capacity)
+    for entry in entries:
         total += 1
         succeeded = entry.status == "ok"
         if not succeeded:

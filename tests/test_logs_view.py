@@ -5,6 +5,7 @@ from __future__ import annotations
 import httpx
 import pytest
 from asgi_lifespan import LifespanManager
+from conftest import FormClient
 
 from mail_mcp import server, web
 from mail_mcp.accounts import MailAccount
@@ -49,7 +50,7 @@ async def connection(imap_server, activity_log):
 async def client():
     async with LifespanManager(web.build_app()) as manager:
         transport = httpx.ASGITransport(app=manager.app)
-        async with httpx.AsyncClient(
+        async with FormClient(
             transport=transport, base_url="https://gateway.test", follow_redirects=False
         ) as http:
             yield http

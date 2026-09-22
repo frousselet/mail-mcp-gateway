@@ -44,10 +44,19 @@ services:
 
   # One mailbox from the environment, served over HTTP. Opt-in:
   #   docker compose --profile single up
+  #
+  # WARNING: this profile has NO authentication. Whoever reaches the port can
+  # read the mailbox and send mail as its owner. It is therefore published on
+  # this machine's loopback only (127.0.0.1); do not change that to expose it.
+  # For anything reachable from elsewhere, use the default service above,
+  # which puts OAuth in front of the MCP endpoint.
   mail-mcp-single:
     build: .
     command: ["--transport", "streamable-http", "--host", "0.0.0.0", "--port", "8000"]
     environment:
+      # Inside the container the server must listen on all interfaces for the
+      # port mapping to reach it; the mapping below keeps it on loopback.
+      MAIL_INSECURE_HTTP: "1"
       MAIL_ADDRESS: ${MAIL_ADDRESS:-}
       MAIL_PASSWORD: ${MAIL_PASSWORD:-}
       MAIL_IMAP_HOST: ${MAIL_IMAP_HOST:-}
@@ -63,7 +72,7 @@ services:
       MAIL_CALDAV_URL: ${MAIL_CALDAV_URL:-}
       MAIL_CALDAV_TIMEZONE: ${MAIL_CALDAV_TIMEZONE:-UTC}
     ports:
-      - "${MCP_PORT:-8000}:8000"
+      - "127.0.0.1:${MCP_PORT:-8000}:8000"
     restart: unless-stopped
     profiles: ["single"]
 
