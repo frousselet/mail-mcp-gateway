@@ -261,3 +261,40 @@ async def test_list_accounts_shows_calendars(tools, monkeypatch):
     assert "ada@example.test" in out
     assert "calendar account" in out
     assert "No mailbox is attached" in out
+
+
+async def test_updating_works_against_a_server_with_stale_report_etags(tools, caldav_server):
+    """The field bug: iCloud's query ETags are not the resource's validator."""
+    caldav_server.stale_report_etags = True
+    uid = _seed(caldav_server, "Point", "2026-09-22T20:30", "2026-09-22T21:00")
+
+    out = await tools.update_event(
+        uid=uid, start="2026-09-22T20:30", end="2026-09-22T21:30"
+    )
+    assert out.startswith("Updated"), out
+    assert "changed" not in out
+
+    listing = await tools.list_events(start="2026-09-22", end="2026-09-23")
+    assert "2026-09-22 20:30 to 21:30" in listing
+
+
+async def test_answering_and_deleting_also_survive_stale_etags(tools, caldav_server):
+    caldav_server.stale_report_etags = True
+    invite = _seed(caldav_server, "Invitation", "2026-09-24T10:00", "2026-09-24T11:00",
+                   attendees=["ada@example.test"])
+    assert "as accept" in await tools.respond_to_event(uid=invite, response="accept")
+
+    doomed = _seed(caldav_server, "A supprimer", "2026-09-25T10:00", "2026-09-25T11:00")
+    assert "Deleted" in await tools.delete_event(uid=doomed)
+
+
+async def test_a_concurrent_edit_is_retried_then_reported(tools, caldav_server):
+    uid = _seed(caldav_server, "Disputé", "2026-09-24T10:00", "2026-09-24T11:00")
+
+    caldav_server.conflict_puts = 1  # one lost race is replayed transparently
+    assert "Updated" in await tools.update_event(uid=uid, summary="Gagné")
+
+    caldav_server.conflict_puts = 99  # a real fight is reported, not hidden
+    out = await tools.update_event(uid=uid, summary="Perdu")
+    assert out.startswith("Error:")
+    assert "something else is editing this event" in out

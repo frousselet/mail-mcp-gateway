@@ -104,6 +104,19 @@ class CalendarInfo:
         return wanted in (self.name.lower(), self.href.lower().rstrip("/"))
 
 
+def usable_etag(etag: str) -> str:
+    """The ETag to put in ``If-Match``, or "" when there is none to trust.
+
+    A weak validator (``W/"..."``) is not allowed in ``If-Match`` (RFC 9110,
+    13.1.1), and an empty one means the server gave us nothing to be
+    conditional about.
+    """
+    cleaned = (etag or "").strip()
+    if not cleaned or cleaned.upper().startswith("W/"):
+        return ""
+    return cleaned
+
+
 def _escape(value: str) -> str:
     return (
         value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
@@ -178,8 +191,10 @@ class CalDavClient:
             )
         if response.status_code == 412:
             raise CalDavError(
-                "That event changed on the server since it was read. "
-                "Read it again and re-apply the change.",
+                "The server rejected the write because the event changed "
+                "underneath it. The change was re-applied to the newer version "
+                "and rejected again, so something else is editing this event "
+                "right now.",
                 status=412,
             )
         if response.status_code == 404:
@@ -347,7 +362,7 @@ class CalDavClient:
             records += parse_events(
                 data_node.text,
                 href=href_node.text.strip(),
-                etag=(etag_node.text or "").strip() if etag_node is not None else "",
+                etag=usable_etag(etag_node.text or "") if etag_node is not None else "",
                 calendar=calendar.name,
             )
         return records
@@ -395,7 +410,7 @@ class CalDavClient:
         records = parse_events(
             response.content,
             href=href,
-            etag=response.headers.get("ETag", ""),
+            etag=usable_etag(response.headers.get("ETag", "")),
             calendar=calendar,
         )
         if not records:
@@ -449,6 +464,68 @@ class CalDavClient:
             expected=(200, 201, 204),
             what="event update",
         )
+
+    async def update_resource(
+        self,
+        href: str,
+        transform,
+        *,
+        calendar: str = "",
+        attempts: int = 2,
+    ) -> EventRecord:
+        """Read a resource, apply ``transform`` to its bytes, write it back.
+
+        The validator comes from **this** GET, not from the REPORT that found
+        the event: several servers, iCloud among them, hand out ETags in a
+        ``calendar-query`` that do not match the resource's current validator,
+        which would make every conditional write fail with 412 even when
+        nobody else touched the event.
+
+        If the write still loses a race, the whole read-modify-write is
+        replayed once against the newer version before giving up, so a change
+        the agent asked for is not dropped because of a concurrent edit it
+        could not have known about.
+        """
+        self._guard_read_only("changing events")
+        last_error: CalDavError | None = None
+        for attempt in range(max(1, attempts)):
+            current = await self.fetch(href, calendar)
+            updated = transform(current.raw)
+            try:
+                await self.replace(href, updated, etag=current.etag)
+                return current
+            except CalDavError as e:
+                if e.status != 412:
+                    raise
+                last_error = e
+                logger.info(
+                    "Conditional write on %s lost a race (attempt %d); re-reading",
+                    href,
+                    attempt + 1,
+                )
+        raise last_error or CalDavError("The event could not be updated.")
+
+    async def delete_resource(
+        self, href: str, *, calendar: str = "", attempts: int = 2
+    ) -> EventRecord:
+        """Delete a resource, conditional on the version just read."""
+        self._guard_read_only("deleting events")
+        last_error: CalDavError | None = None
+        for attempt in range(max(1, attempts)):
+            current = await self.fetch(href, calendar)
+            try:
+                await self.delete(href, etag=current.etag)
+                return current
+            except CalDavError as e:
+                if e.status != 412:
+                    raise
+                last_error = e
+                logger.info(
+                    "Conditional delete on %s lost a race (attempt %d); re-reading",
+                    href,
+                    attempt + 1,
+                )
+        raise last_error or CalDavError("The event could not be deleted.")
 
     async def delete(self, href: str, etag: str = "") -> None:
         self._guard_read_only("deleting events")

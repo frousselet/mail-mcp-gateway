@@ -56,6 +56,13 @@ class FakeCalDAVState:
             ),
         }
         self.requests: list[tuple[str, str]] = []  # (method, path), for assertions
+        # Servers do not all behave. These reproduce two real ones:
+        # stale_report_etags: a calendar-query hands out validators that do not
+        # match the resource's current ETag (observed on iCloud), so a write
+        # conditional on the REPORT's ETag is rejected with 412.
+        self.stale_report_etags = False
+        # conflict_puts: the next N conditional writes lose a race.
+        self.conflict_puts = 0
 
     def calendar_of(self, path: str) -> FakeCalendar | None:
         for href, calendar in self.calendars.items():
@@ -201,9 +208,10 @@ def _report(state: FakeCalDAVState, path: str, body: str) -> Response:
             if end < window[0].replace("T", "") or start > window[1].replace("T", ""):
                 continue
         data = ics.decode().replace("&", "&amp;").replace("<", "&lt;")
+        reported = f'"{etag.strip(chr(34))}-from-report"' if state.stale_report_etags else etag
         parts.append(
             f"<d:response><d:href>{href}</d:href><d:propstat><d:prop>"
-            f"<d:getetag>{etag}</d:getetag>"
+            f"<d:getetag>{reported}</d:getetag>"
             f"<c:calendar-data>{data}</c:calendar-data>"
             "</d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>"
         )
@@ -233,6 +241,10 @@ def _put(state: FakeCalDAVState, path: str, ics: bytes, headers) -> Response:
     if if_match:
         if existing is None:
             return PlainTextResponse("Gone", status_code=404)
+        if state.conflict_puts > 0:
+            state.conflict_puts -= 1
+            calendar.put(path, existing[0])  # someone else wrote first
+            return PlainTextResponse("Precondition failed", status_code=412)
         if if_match != existing[1]:
             return PlainTextResponse("Precondition failed", status_code=412)
 

@@ -1443,18 +1443,27 @@ async def update_event(
         _ensure_calendar_writable(calendar_account, "changing events")
         event, target = await _find_event(client, uid, calendar)
         tz = calendar_account.timezone
-        updated = edit_event(
-            event.raw,
-            summary=summary,
-            start=parse_when(start, tz) if start else None,
-            end=parse_when(end, tz) if end else None,
-            location=location,
-            description=description,
-            attendees=attendees,
-            recurrence=recurrence,
-            status=status,
+        starts = parse_when(start, tz) if start else None
+        ends = parse_when(end, tz) if end else None
+
+        def apply(raw: bytes) -> bytes:
+            return edit_event(
+                raw,
+                summary=summary,
+                start=starts,
+                end=ends,
+                location=location,
+                description=description,
+                attendees=attendees,
+                recurrence=recurrence,
+                status=status,
+            )
+
+        # Re-read the resource and write against its own validator: the ETag
+        # from the UID lookup is not one every server will honour.
+        event = await client.update_resource(
+            event.href, apply, calendar=target.name
         )
-        await client.replace(event.href, updated, etag=event.etag)
         changed = [
             name
             for name, value in (
@@ -1494,7 +1503,7 @@ async def delete_event(
         calendar_account, client = _resolve_calendar(account)
         _ensure_calendar_writable(calendar_account, "deleting events")
         event, target = await _find_event(client, uid, calendar)
-        await client.delete(event.href, etag=event.etag)
+        event = await client.delete_resource(event.href, calendar=target.name)
         return formatting.format_action(
             f"Deleted **{event.summary or uid}** from {target.name} "
             f"({calendar_account.address}). This cannot be undone.",
@@ -1526,8 +1535,13 @@ async def respond_to_event(
         calendar_account, client = _resolve_calendar(account)
         _ensure_calendar_writable(calendar_account, "answering invitations")
         event, target = await _find_event(client, uid, calendar)
-        answered = set_participation(event.raw, calendar_account.address, response)
-        await client.replace(event.href, answered, etag=event.etag)
+
+        def apply(raw: bytes) -> bytes:
+            return set_participation(raw, calendar_account.address, response)
+
+        event = await client.update_resource(
+            event.href, apply, calendar=target.name
+        )
         return formatting.format_action(
             f"Answered **{event.summary or uid}** as {response.lower()} "
             f"({calendar_account.address}).",

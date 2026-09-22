@@ -156,7 +156,7 @@ async def test_update_uses_the_etag(client, caldav_server):
     assert b"Apr" in caldav_server.calendars["/calendars/ada/personal/"].entries[href][0]
 
     # The stale ETag must now be refused rather than clobbering the change.
-    with pytest.raises(CalDavError, match="changed on the server"):
+    with pytest.raises(CalDavError, match="changed underneath it"):
         await client.replace(href, updated, etag=event.etag)
 
 
@@ -200,3 +200,74 @@ async def test_unreachable_server_is_explained(calendar_account):
     with pytest.raises(CalDavError, match="Cannot reach the CalDAV server"):
         await client.list_calendars()
     await client.close()
+
+
+# ---------------------------------------------------------------------------
+# Read-modify-write: the validator must come from the resource, not the query
+# ---------------------------------------------------------------------------
+
+
+async def test_write_survives_a_server_whose_report_etags_are_stale(client, caldav_server):
+    """iCloud hands out calendar-query ETags that do not match the resource."""
+    caldav_server.stale_report_etags = True
+    uid, ics = _ics(summary="Avant")
+    href, _ = await client.create(ics, uid, calendar="Personal")
+
+    # The UID lookup now reports a validator the server will not honour.
+    found, _ = await client.find_by_uid(uid, calendar="Personal")
+    stored_etag = caldav_server.calendars["/calendars/ada/personal/"].entries[href][1]
+    assert found.etag != stored_etag
+
+    # Writing against that validator is exactly what used to fail in the field.
+    with pytest.raises(CalDavError, match="changed underneath it"):
+        await client.replace(
+            href, edit_event(found.raw, summary="Après"), etag=found.etag
+        )
+
+    # Writing through update_resource re-reads first, so it still works.
+    await client.update_resource(
+        href, lambda raw: edit_event(raw, summary="Après"), calendar="Personal"
+    )
+    body = caldav_server.calendars["/calendars/ada/personal/"].entries[href][0]
+    assert b"Apr" in body
+
+
+async def test_a_lost_race_is_replayed_once(client, caldav_server):
+    uid, ics = _ics(summary="Avant")
+    href, _ = await client.create(ics, uid, calendar="Personal")
+    caldav_server.conflict_puts = 1  # the first conditional write loses
+
+    await client.update_resource(
+        href, lambda raw: edit_event(raw, summary="Après"), calendar="Personal"
+    )
+    body = caldav_server.calendars["/calendars/ada/personal/"].entries[href][0]
+    assert b"Apr" in body
+    assert caldav_server.conflict_puts == 0
+
+
+async def test_a_persistent_conflict_is_reported_honestly(client, caldav_server):
+    uid, ics = _ics(summary="Avant")
+    href, _ = await client.create(ics, uid, calendar="Personal")
+    caldav_server.conflict_puts = 99  # something else keeps writing
+
+    with pytest.raises(CalDavError, match="something else is editing this event"):
+        await client.update_resource(
+            href, lambda raw: edit_event(raw, summary="Après"), calendar="Personal"
+        )
+
+
+async def test_weak_validators_are_not_used_for_if_match():
+    from mail_mcp.caldav_client import usable_etag
+
+    assert usable_etag('"abc"') == '"abc"'
+    assert usable_etag('W/"abc"') == ""
+    assert usable_etag("  ") == ""
+    assert usable_etag(None) == ""
+
+
+async def test_delete_re_reads_before_removing(client, caldav_server):
+    caldav_server.stale_report_etags = True
+    uid, ics = _ics(summary="A supprimer")
+    href, _ = await client.create(ics, uid, calendar="Personal")
+    await client.delete_resource(href, calendar="Personal")
+    assert href not in caldav_server.calendars["/calendars/ada/personal/"].entries
