@@ -98,3 +98,12 @@ class FormClient(httpx.AsyncClient):
                 await self.get("/assets/app.css")
             data = {**data, "csrf": session_csrf(self)}
         return await super().post(url, *args, data=data, **kwargs)
+
+
+@pytest.fixture(autouse=True)
+def _fresh_probe_budget():
+    """Each test starts with a full allowance of connection tests."""
+    web = sys.modules.get("mail_mcp.web")
+    if web is not None:
+        web._probe_log.clear()
+    yield

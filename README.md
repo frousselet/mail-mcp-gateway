@@ -91,12 +91,34 @@ Writes are conditional: an event is re-read before being changed and the `PUT`
 carries the `ETag` it was read with, so a change someone made meanwhile is
 reported instead of being silently overwritten. Updates keep the properties the
 agent knows nothing about (alarms, scheduling state, custom fields) rather than
-rewriting the event from scratch. A calendar account can also be attached
-**read-only**.
+rewriting the event from scratch, and keep the whole resource: the modified
+occurrences of a recurring event and its timezone definitions are written back
+untouched. A calendar account can also be attached **read-only**.
+
+Recurring events are expanded for reading, so a daily meeting appears (and is
+busy for `find_free_time`) on every day of the window, with moved and cancelled
+occurrences applied. For an all-day event, `end` is the last day, inclusive.
 
 Times are forgiving on input: `2026-09-24T10:00`, `2026-09-24`, `today`,
 `tomorrow`, `+7d`. A time written without an offset is read in the calendar
 account's own timezone, which is set per account.
+
+## Dashboard
+
+The home page answers two questions: is everything working, and what have the
+agents been doing? It opens on a one-line verdict, then five figures (calls in
+the last 24 hours against the day before, calls over the fortnight, success
+rate, typical response time, accounts reachable), the calls per day with
+failures stacked on top, and side by side what needs attention (an unfinished
+connector, the latest failed or refused calls with their reason, open sign-up)
+and the latest calls. A table gives each connector its status in words
+(Working, Some calls failed, Waiting for the agent, Not finished, Quiet this
+week), its fortnight as a sparkline, its weekly volume and failures, and when
+it was last used. The most used tools and the busiest accounts close the page.
+
+Managing connectors (credentials, mailboxes, calendars, deletion) lives on
+`/connectors`. A first visit, with nothing created yet, gets a three-step guide
+and the form to create the first connector instead.
 
 ## Activity log
 
@@ -113,9 +135,8 @@ ever sees their own connectors.
 | Timestamps                                            | Passwords, tokens, client secrets   |
 
 The page leads with three figures, then plots calls per day over a fortnight
-with failures stacked on top, and the tools the agents actually reach for. Each
-connector on the dashboard carries its own sparkline and when it was last used,
-so a dormant or misbehaving one is visible without opening anything.
+with failures stacked on top, and the tools the agents actually reach for. A
+refresh token presented twice (see Security) is recorded here too.
 
 The charts are server-rendered HTML, not a charting library: no script runs, the
 strict CSP holds, and the labels keep their size on a phone instead of shrinking
@@ -280,10 +301,39 @@ picks the one to act on.
   page rather than by a `confirm()` dialog.
 - A mailbox can be attached read-only, which is enforced before anything is
   composed, sent or written.
+- Mail and invitations are written by other people, sometimes to steer the
+  agent. Bodies and event descriptions come back fenced between
+  `<<<untrusted-content>>>` markers the content cannot forge, one-line fields
+  (subject, sender, title) cannot fake a new line of output, and the
+  instructions tell the agent to treat all of it as data. The sending and
+  deleting tools take `dry_run=true` to show what would happen first.
+- In multi-user mode the gateway does not connect to loopback, private,
+  link-local or shared addresses (IMAP, SMTP, CalDAV with every redirect hop,
+  autoconfig), so a signed-in user cannot use it to reach what sits next to it.
+  `MAIL_ALLOW_PRIVATE_TARGETS=1` allows it, for a mail server on your LAN or a
+  Proton Mail Bridge. Connection tests are limited to ten a minute per user.
+- Every form carries a per-session anti-forgery token, and state-changing
+  requests a browser marks as cross-site or cross-origin are refused.
+- Passkeys are bound to `MAIL_PUBLIC_URL`, or, when it is not set, to the origin
+  of the first successful sign-in, never to whatever Host header a request
+  brings. Setting `MAIL_PUBLIC_URL` also turns on the Host check of `/mcp`.
+- A refresh token is single use: presenting one a second time revokes every
+  token of that authorization (RFC 9700) and shows in the activity log.
+- The OAuth client secret of an XOAUTH2 mailbox is encrypted like the rest.
+- Expired authorization codes and tokens are purged every five minutes, and
+  pending codes are capped per connector, so `/authorize` cannot grow the store.
+- Deleting a connector closes its open IMAP and CalDAV sessions at once; idle
+  ones close after fifteen minutes.
+- Plain `http://` CalDAV URLs are refused (the password travels in every
+  request), except for a server on localhost. A write the server redirects is
+  reported as not written.
 
 ## Single-mailbox mode
 
-For a local agent that spawns the server itself, skip the web UI entirely:
+For a local agent that spawns the server itself, skip the web UI entirely.
+This mode has **no authentication**: over HTTP it only listens on loopback
+unless `MAIL_INSECURE_HTTP=1` is set, and the compose `single` profile is
+published on `127.0.0.1` only.
 
 ```bash
 export MAIL_ADDRESS=you@example.com MAIL_PASSWORD=app-password
@@ -315,7 +365,7 @@ every variable.
 
 ```bash
 uv venv && uv pip install -e ".[dev]"
-uv run pytest        # 312 tests, including fake IMAP and CalDAV servers
+uv run pytest        # 401 tests, including fake IMAP and CalDAV servers
 uv run ruff check src tests
 ```
 

@@ -150,8 +150,10 @@ def daily_activity_chart(days: Sequence[DayPoint], *, title: str) -> str:
 </figure>"""
 
 
-def tool_usage_chart(counts: Sequence[tuple[str, int]], *, title: str) -> str:
-    """Which tools the agents actually reach for. One series, so no legend."""
+def tool_usage_chart(
+    counts: Sequence[tuple[str, int]], *, title: str, column: str = "Tool"
+) -> str:
+    """Ranked horizontal bars (tools, mailboxes...). One series, so no legend."""
     if not counts:
         return ""
     top = max(count for _, count in counts)
@@ -172,12 +174,12 @@ def tool_usage_chart(counts: Sequence[tuple[str, int]], *, title: str) -> str:
 <figure class="chart">
   <figcaption>{_esc(title)}</figcaption>
   <div class="bars" role="img" aria-label="{_esc(title)}: {_esc(counts[0][0])} leads
-    with {counts[0][1]} calls, out of {len(counts)} tools shown.">{rows}</div>
+    with {counts[0][1]} calls, out of {len(counts)} shown.">{rows}</div>
   <details class="chart-data">
     <summary>See the numbers</summary>
     <div class="table-wrap"><table>
       <caption class="sr-only">{_esc(title)}</caption>
-      <thead><tr><th scope="col">Tool</th><th scope="col">Calls</th></tr></thead>
+      <thead><tr><th scope="col">{_esc(column)}</th><th scope="col">Calls</th></tr></thead>
       <tbody>{table_rows}</tbody>
     </table></div>
   </details>

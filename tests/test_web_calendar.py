@@ -74,7 +74,7 @@ async def test_attach_a_calendar(client, caldav_server):
         f"/connections/{connection_id}/calendars", data=_form(caldav_server)
     )
     assert response.status_code == 303
-    assert response.headers["location"] == "/?notice=calendar_added"
+    assert response.headers["location"] == "/connectors?notice=calendar_added"
     dashboard = await client.get(response.headers["location"])
     assert "Calendar added" in dashboard.text
 

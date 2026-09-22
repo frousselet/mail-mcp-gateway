@@ -39,6 +39,34 @@ def _connection(label: str = "Work", accounts: list | None = None, calendars: li
     }
 
 
+NOW = 1790000000.0
+
+
+def _overview(tmp: str | None = None):
+    import tempfile
+    from pathlib import Path
+
+    from mail_mcp.activity import ActivityEntry, ActivityLog, overview
+
+    log = ActivityLog(str(Path(tmp or tempfile.mkdtemp()) / "a.jsonl"), max_entries=500)
+    for index in range(30):
+        log.append(ActivityEntry(
+            ts=NOW - index * 5000, tool=["search_messages", "send_message"][index % 2],
+            status="error" if index == 3 else "ok", owner_id="u",
+            connection_id="con_1", connection_label="Work",
+            account="ada@example.test", duration_ms=100 + index,
+            detail="IMAP login rejected" if index == 3 else "",
+        ))
+    return overview(log, "u", now=NOW)
+
+
+def _home(connections, **kwargs) -> str:
+    return ui.home_page(
+        "owner@example.test", connections=connections, overview=_overview(),
+        now=NOW, **kwargs,
+    )
+
+
 def _every_page() -> dict[str, str]:
     """One of each page, so the invariants below are checked across the module."""
     entry = {
@@ -57,7 +85,9 @@ def _every_page() -> dict[str, str]:
         "register": ui.register_page(),
         "register_signed_in": ui.register_page(signed_in=True),
         "login": ui.login_page(),
-        "dashboard": ui.dashboard_page("owner@example.test", [_connection()]),
+        "connectors": ui.connectors_page("owner@example.test", [_connection()]),
+        "home": _home([_connection(), _connection(label="Idle", accounts=[])]),
+        "home_empty": _home([]),
         "mailbox_form": ui.mailbox_form_page(_connection()),
         "calendar_form": ui.calendar_form_page(_connection()),
         "credentials": ui.credentials_page("https://gateway.test", _connection(), "s3cr3t"),
@@ -141,8 +171,9 @@ def test_tables_are_labelled_and_scoped():
         for table in re.findall(r"<table.*?</table>", html, re.S):
             assert "<caption" in table, name
             assert "<thead>" in table, name
-            headers = re.findall(r"<th\b", table)  # <thead> must not count
-            assert len(headers) == table.count('scope="col"'), name
+            headers = re.findall(r"<th\b[^>]*>", table)  # <thead> must not count
+            for header in headers:
+                assert 'scope="col"' in header or 'scope="row"' in header, (name, header)
 
 
 def test_no_button_nested_in_a_link():
@@ -159,7 +190,7 @@ EVIL = "a'+alert(document.domain)+'b@x.io"
 
 
 def test_user_values_are_escaped_everywhere():
-    html = ui.dashboard_page(
+    html = ui.connectors_page(
         "<script>alert(1)</script>",
         [_connection(label="<img src=x onerror=alert(1)>")],
     )
@@ -170,7 +201,7 @@ def test_user_values_are_escaped_everywhere():
 
 def test_an_address_with_an_apostrophe_cannot_reach_a_script_context():
     """The old confirm() handler decoded &#x27; back into a quote and broke out."""
-    html = ui.dashboard_page(
+    html = ui.connectors_page(
         "owner@example.test",
         [_connection(accounts=[{
             "account_id": "box_1", "address": EVIL, "imap": "i", "smtp": "s",
@@ -206,8 +237,8 @@ def test_register_page_asks_for_the_invite_code_only_when_one_is_required():
     assert 'id="code"' not in ui.register_page(invite_required=False)
 
 
-def test_dashboard_says_what_the_agent_may_do_in_words():
-    writable = ui.dashboard_page("owner@example.test", [_connection()])
+def test_connectors_page_says_what_the_agent_may_do_in_words():
+    writable = ui.connectors_page("owner@example.test", [_connection()])
     assert "Can send and delete" in writable
 
     read_only = _connection(accounts=[{
@@ -215,17 +246,50 @@ def test_dashboard_says_what_the_agent_may_do_in_words():
         "auth": "password", "sends_as": ["ada@example.test"], "read_only": True,
         "is_default": True,
     }])
-    assert "Read only" in ui.dashboard_page("owner@example.test", [read_only])
+    assert "Read only" in ui.connectors_page("owner@example.test", [read_only])
 
 
-def test_dashboard_shows_last_use_and_flags_an_unfinished_connector():
-    assert "3 minutes ago" in ui.dashboard_page("owner@example.test", [_connection()])
-    empty = ui.dashboard_page("owner@example.test", [_connection(accounts=[])])
+def test_connectors_page_shows_last_use_and_flags_an_unfinished_connector():
+    assert "3 minutes ago" in ui.connectors_page("owner@example.test", [_connection()])
+    empty = ui.connectors_page("owner@example.test", [_connection(accounts=[])])
     assert "no mailbox and no calendar" in empty
 
 
-def test_dashboard_without_connectors_explains_what_one_is():
-    html = ui.dashboard_page("owner@example.test", [])
+def test_the_home_page_is_a_dashboard():
+    html = _home([_connection()])
+    for expected in (
+        "Calls, last 24 hours", "Success rate", "Typical response",
+        "Calls per day, last 14 days", "Most used tools", "Busiest accounts",
+        "Needs attention", "Latest calls", "Manage connectors",
+    ):
+        assert expected in html, expected
+    assert "IMAP login rejected" in html  # the failure is shown, with its reason
+    assert 'aria-current="page">Dashboard' in html
+
+
+def test_the_dashboard_names_what_each_connector_needs():
+    html = _home([_connection(label="Empty", accounts=[])])
+    assert "Not finished" in html and "Attach a mailbox or a calendar" in html
+    assert "/connections/con_1" in html
+
+
+def test_the_dashboard_warns_about_open_sign_up_only_when_it_is_open():
+    assert "MAIL_ONBOARD_CODE" in _home([_connection()], open_registration=True)
+    assert "MAIL_ONBOARD_CODE" not in _home([_connection()], open_registration=False)
+
+
+def test_a_first_visit_gets_a_guided_start():
+    html = _home([])
+    assert "Get started" in html and 'action="/connections/new"' in html
+
+
+def test_dashboard_values_are_escaped():
+    html = _home([_connection(label="<img src=x onerror=alert(1)>")])
+    assert "<img src=x" not in html
+
+
+def test_connectors_page_without_connectors_explains_what_one_is():
+    html = ui.connectors_page("owner@example.test", [])
     assert "No connector yet" in html
     assert "one connection for one agent" in html
 

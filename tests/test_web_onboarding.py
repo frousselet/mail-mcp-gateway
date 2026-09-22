@@ -87,7 +87,7 @@ async def test_attach_a_mailbox_and_see_it_listed(client, imap_server, smtp_ok):
         f"/connections/{connection_id}/mailboxes", data=_mailbox_form(imap_server)
     )
     assert response.status_code == 303, response.text
-    assert response.headers["location"] == "/?notice=mailbox_added"
+    assert response.headers["location"] == "/connectors?notice=mailbox_added"
     dashboard = await client.get(response.headers["location"])
     assert "Mailbox added" in dashboard.text
     assert imap_server.state.username in dashboard.text
@@ -349,3 +349,22 @@ async def test_pages_with_secrets_are_not_cached(client):
     assert (await client.get("/logs")).headers["cache-control"] == "no-store"
     # The fingerprinted assets stay cacheable; that is the point of the hash.
     assert "immutable" in (await client.get("/assets/app.css")).headers["cache-control"]
+
+
+async def test_home_is_the_dashboard_and_connectors_have_their_own_page(
+    client, monkeypatch
+):
+    # A user of its own: other tests have created connectors for USER_ID.
+    monkeypatch.setattr(web, "_uid", lambda request: "usr_dashboard_only")
+    first = await client.get("/")
+    assert first.status_code == 200
+    assert "Get started" in first.text  # nothing created yet for this user
+
+    await _new_connector(client, label="Dashboard test")
+    home = await client.get("/")
+    assert "Calls, last 24 hours" in home.text
+    assert "Dashboard test" in home.text and "Not finished" in home.text
+
+    page = await client.get("/connectors")
+    assert page.status_code == 200
+    assert "New connector" in page.text and "Dashboard test" in page.text

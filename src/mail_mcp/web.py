@@ -327,21 +327,30 @@ NOTICES = {
 }
 
 
-def _dashboard(request: Request, error: str = "", notice: str = "") -> HTMLResponse:
+async def _views(request: Request):
+    """The signed-in user's connectors, with their activity, from one log read."""
     store = _store()
     uid = _uid(request) or ""
     base_url = _base_url(request)
-    overview = activity.overview(server.ACTIVITY, uid) if uid else None
+    overview = (
+        await asyncio.to_thread(activity.overview, server.ACTIVITY, uid) if uid else None
+    )
     summary = overview.by_connection if overview else {}
     email = request.session.get("email", "")
     connections = [
         _connection_view(connection, base_url, activity_summary=summary, email=email)
         for connection in (store.list_connections(owner_id=uid) if store else [])
     ]
+    return email, connections, overview
+
+
+async def _dashboard(request: Request, error: str = "", notice: str = "") -> HTMLResponse:
+    """The connectors page (named for what it used to be: the home page)."""
+    email, connections, _ = await _views(request)
     if not notice:
         notice = NOTICES.get(request.query_params.get("notice", ""), "")
     return HTMLResponse(
-        ui.dashboard_page(
+        ui.connectors_page(
             email,
             connections,
             error=error,
@@ -606,9 +615,27 @@ async def logout(request: Request) -> Response:
 
 @mcp.custom_route("/", methods=["GET"])
 async def home(request: Request) -> Response:
+    """The dashboard: is everything fine, and what have the agents done?"""
     if not _uid(request):
         return RedirectResponse("/login", status_code=303)
-    return _dashboard(request)
+    email, connections, overview = await _views(request)
+    return HTMLResponse(
+        ui.home_page(
+            email,
+            connections=connections,
+            overview=overview,
+            now=time.time(),
+            open_registration=not os.environ.get("MAIL_ONBOARD_CODE"),
+            notice=NOTICES.get(request.query_params.get("notice", ""), ""),
+        )
+    )
+
+
+@mcp.custom_route("/connectors", methods=["GET"])
+async def connectors(request: Request) -> Response:
+    if not _uid(request):
+        return RedirectResponse("/login", status_code=303)
+    return await _dashboard(request)
 
 
 @mcp.custom_route("/connections/new", methods=["POST"])
@@ -625,10 +652,10 @@ async def connection_new(request: Request) -> Response:
         return _expired()
     gate = os.environ.get("MAIL_ONBOARD_CODE")
     if gate and str(form.get("onboard_code", "")) != gate:
-        return _dashboard(request, error="Invalid invite code.")
+        return await _dashboard(request, error="Invalid invite code.")
     label = str(form.get("label", "")).strip()
     if not label:
-        return _dashboard(request, error="Give the connector a name.")
+        return await _dashboard(request, error="Give the connector a name.")
 
     connection = await store.create_connection(owner_id=uid, label=label)
     logger.info("User %s created connector %s (%r)", uid, connection.connection_id, label)
@@ -651,7 +678,7 @@ async def connection_credentials(request: Request) -> Response:
     store = _store()
     connection = store.get_connection(request.path_params["connection_id"]) if store else None
     if connection is None or connection.owner_id != uid:
-        return _dashboard(request, error="That connector no longer exists.")
+        return await _dashboard(request, error="That connector no longer exists.")
     base_url = _base_url(request)
     return HTMLResponse(
         ui.credentials_page(
@@ -673,7 +700,7 @@ async def connection_remove_confirm(request: Request) -> Response:
     connection_id = request.query_params.get("connection_id", "")
     connection = store.get_connection(connection_id) if store else None
     if connection is None or connection.owner_id != uid:
-        return _dashboard(request, error="That connector no longer exists.")
+        return await _dashboard(request, error="That connector no longer exists.")
     return HTMLResponse(
         ui.confirm_page(
             title="Delete this connector",
@@ -702,7 +729,7 @@ async def connection_delete(request: Request) -> Response:
     if form is None:
         return _expired()
     if str(form.get("confirm", "")) != "yes":
-        return _dashboard(request, error="That delete was not confirmed.")
+        return await _dashboard(request, error="That delete was not confirmed.")
     connection_id = str(form.get("connection_id", ""))
     if store and connection_id:
         existing = store.get_connection(connection_id)
@@ -711,7 +738,7 @@ async def connection_delete(request: Request) -> Response:
             # Close its open IMAP and CalDAV sessions now, not at restart.
             _forget(existing.client_id)
         logger.info("User %s deleted connector %s (ok=%s)", uid, connection_id, ok)
-    return _redirect("/", "connector_deleted")
+    return _redirect("/connectors", "connector_deleted")
 
 
 @mcp.custom_route("/connections/rotate", methods=["GET"])
@@ -723,7 +750,7 @@ async def connection_rotate_confirm(request: Request) -> Response:
     connection_id = request.query_params.get("connection_id", "")
     connection = store.get_connection(connection_id) if store else None
     if connection is None or connection.owner_id != uid:
-        return _dashboard(request, error="That connector no longer exists.")
+        return await _dashboard(request, error="That connector no longer exists.")
     return HTMLResponse(
         ui.confirm_page(
             title="Issue a new secret",
@@ -750,13 +777,13 @@ async def connection_rotate(request: Request) -> Response:
     if form is None:
         return _expired()
     if str(form.get("confirm", "")) != "yes":
-        return _dashboard(request, error="That rotation was not confirmed.")
+        return await _dashboard(request, error="That rotation was not confirmed.")
     connection_id = str(form.get("connection_id", ""))
     if store is None or not connection_id:
-        return RedirectResponse("/", status_code=303)
+        return RedirectResponse("/connectors", status_code=303)
     secret = await store.rotate_client_secret(connection_id, owner_id=uid)
     if secret is None:
-        return _dashboard(request, error="That connector no longer exists.")
+        return await _dashboard(request, error="That connector no longer exists.")
     existing = store.get_connection(connection_id)
     if existing is not None:
         _forget(existing.client_id)
@@ -774,7 +801,7 @@ async def connection_detail(request: Request) -> Response:
     connection_id = request.path_params["connection_id"]
     connection = store.get_connection(connection_id) if store else None
     if connection is None or connection.owner_id != uid:
-        return _dashboard(request, error="That connector no longer exists.")
+        return await _dashboard(request, error="That connector no longer exists.")
     return HTMLResponse(
         ui.mailbox_form_page(
             _connection_view(
@@ -834,7 +861,7 @@ async def mailbox_add(request: Request) -> Response:
     connection_id = request.path_params["connection_id"]
     connection = store.get_connection(connection_id) if store else None
     if connection is None or connection.owner_id != uid:
-        return _dashboard(request, error="That connector no longer exists.")
+        return await _dashboard(request, error="That connector no longer exists.")
 
     view = _connection_view(
         connection, _base_url(request), email=request.session.get("email", "")
@@ -867,9 +894,9 @@ async def mailbox_add(request: Request) -> Response:
     account.settings_source = "manual"
     saved = await store.add_account(connection_id, account, owner_id=uid)
     if saved is None:
-        return _dashboard(request, error="Could not attach that mailbox.")
+        return await _dashboard(request, error="Could not attach that mailbox.")
     logger.info("User %s attached %s to %s", uid, account.address, connection_id)
-    return _redirect("/", "mailbox_added")
+    return _redirect("/connectors", "mailbox_added")
 
 
 @mcp.custom_route("/mailboxes/remove", methods=["GET"])
@@ -882,10 +909,10 @@ async def mailbox_remove_confirm(request: Request) -> Response:
     account_id = request.query_params.get("account_id", "")
     connection = store.get_connection(connection_id) if store else None
     if connection is None or connection.owner_id != uid:
-        return _dashboard(request, error="That connector no longer exists.")
+        return await _dashboard(request, error="That connector no longer exists.")
     box = next((a for a in connection.accounts if a.account_id == account_id), None)
     if box is None:
-        return _dashboard(request, error="That mailbox is already gone.")
+        return await _dashboard(request, error="That mailbox is already gone.")
     return HTMLResponse(
         ui.confirm_page(
             title="Remove this mailbox",
@@ -912,12 +939,12 @@ async def mailbox_delete(request: Request) -> Response:
     if form is None:
         return _expired()
     if str(form.get("confirm", "")) != "yes":
-        return _dashboard(request, error="That removal was not confirmed.")
+        return await _dashboard(request, error="That removal was not confirmed.")
     connection_id = str(form.get("connection_id", ""))
     account_id = str(form.get("account_id", ""))
     if store and connection_id and account_id:
         await store.remove_account(connection_id, account_id, owner_id=uid)
-    return _redirect("/", "mailbox_removed")
+    return _redirect("/connectors", "mailbox_removed")
 
 
 @mcp.custom_route("/mailboxes/default", methods=["POST"])
@@ -933,7 +960,7 @@ async def mailbox_default(request: Request) -> Response:
     account_id = str(form.get("account_id", ""))
     if store and connection_id and account_id:
         await store.set_default_account(connection_id, account_id, owner_id=uid)
-    return _redirect("/", "default_changed")
+    return _redirect("/connectors", "default_changed")
 
 
 @mcp.custom_route("/calendars/default", methods=["POST"])
@@ -949,7 +976,7 @@ async def calendar_default(request: Request) -> Response:
     calendar_id = str(form.get("calendar_id", ""))
     if store and connection_id and calendar_id:
         await store.set_default_calendar(connection_id, calendar_id, owner_id=uid)
-    return _redirect("/", "default_changed")
+    return _redirect("/connectors", "default_changed")
 
 
 # ---------------------------------------------------------------------------
@@ -1008,7 +1035,7 @@ async def calendar_form(request: Request) -> Response:
     connection_id = request.path_params["connection_id"]
     connection = store.get_connection(connection_id) if store else None
     if connection is None or connection.owner_id != uid:
-        return _dashboard(request, error="That connector no longer exists.")
+        return await _dashboard(request, error="That connector no longer exists.")
     return HTMLResponse(
         ui.calendar_form_page(
             _connection_view(
@@ -1027,7 +1054,7 @@ async def calendar_add(request: Request) -> Response:
     connection_id = request.path_params["connection_id"]
     connection = store.get_connection(connection_id) if store else None
     if connection is None or connection.owner_id != uid:
-        return _dashboard(request, error="That connector no longer exists.")
+        return await _dashboard(request, error="That connector no longer exists.")
 
     view = _connection_view(
         connection, _base_url(request), email=request.session.get("email", "")
@@ -1057,9 +1084,9 @@ async def calendar_add(request: Request) -> Response:
 
     saved = await store.add_calendar(connection_id, calendar, owner_id=uid)
     if saved is None:
-        return _dashboard(request, error="Could not attach that calendar.")
+        return await _dashboard(request, error="Could not attach that calendar.")
     logger.info("User %s attached calendar %s to %s", uid, calendar.address, connection_id)
-    return _redirect("/", "calendar_added")
+    return _redirect("/connectors", "calendar_added")
 
 
 @mcp.custom_route("/calendars/remove", methods=["GET"])
@@ -1072,12 +1099,12 @@ async def calendar_remove_confirm(request: Request) -> Response:
     calendar_id = request.query_params.get("calendar_id", "")
     connection = store.get_connection(connection_id) if store else None
     if connection is None or connection.owner_id != uid:
-        return _dashboard(request, error="That connector no longer exists.")
+        return await _dashboard(request, error="That connector no longer exists.")
     calendar = next(
         (c for c in connection.calendars if c.account_id == calendar_id), None
     )
     if calendar is None:
-        return _dashboard(request, error="That calendar is already gone.")
+        return await _dashboard(request, error="That calendar is already gone.")
     return HTMLResponse(
         ui.confirm_page(
             title="Remove this calendar",
@@ -1104,18 +1131,49 @@ async def calendar_delete(request: Request) -> Response:
     if form is None:
         return _expired()
     if str(form.get("confirm", "")) != "yes":
-        return _dashboard(request, error="That removal was not confirmed.")
+        return await _dashboard(request, error="That removal was not confirmed.")
     connection_id = str(form.get("connection_id", ""))
     calendar_id = str(form.get("calendar_id", ""))
     if store and connection_id and calendar_id:
         await store.remove_calendar(connection_id, calendar_id, owner_id=uid)
-    return _redirect("/", "calendar_removed")
+    return _redirect("/connectors", "calendar_removed")
+
+
+PROBES_PER_MINUTE = 10
+_probe_log: dict[str, list[float]] = {}
+
+
+def _probe_allowed(uid: str) -> bool:
+    """At most a few connection tests a minute per user.
+
+    A test connects wherever the form says; even with private addresses
+    refused, an unlimited loop of them would make the gateway a scanner.
+    """
+    now = time.monotonic()
+    recent = [t for t in _probe_log.get(uid, []) if now - t < 60]
+    if len(recent) >= PROBES_PER_MINUTE:
+        _probe_log[uid] = recent
+        return False
+    recent.append(now)
+    _probe_log[uid] = recent
+    return True
+
+
+def _slow_down() -> JSONResponse:
+    return JSONResponse(
+        {"ok": False, "found": False, "error": "Too many tests in a row.",
+         "message": "Too many tests in a row. Wait a minute, then try again."},
+        status_code=429,
+    )
 
 
 @mcp.custom_route("/test-calendar", methods=["POST"])
 async def test_calendar(request: Request) -> JSONResponse:
-    if not _uid(request):
+    uid = _uid(request)
+    if not uid:
         return JSONResponse({"error": "sign in first"}, status_code=401)
+    if not _probe_allowed(uid):
+        return _slow_down()
     payload = await request.json()
     try:
         calendar = _calendar_from_form(payload)
@@ -1209,8 +1267,11 @@ async def logs(request: Request) -> Response:
 
 @mcp.custom_route("/discover", methods=["POST"])
 async def discover_settings(request: Request) -> JSONResponse:
-    if not _uid(request):
+    uid = _uid(request)
+    if not uid:
         return JSONResponse({"error": "sign in first"}, status_code=401)
+    if not _probe_allowed(uid):
+        return _slow_down()
     address = str((await request.json()).get("address", "")).strip()
     if "@" not in address:
         return JSONResponse({"error": "enter a full email address"}, status_code=400)
@@ -1242,8 +1303,11 @@ async def _probe(account: MailAccount) -> dict[str, Any]:
 
 @mcp.custom_route("/test", methods=["POST"])
 async def test_settings(request: Request) -> JSONResponse:
-    if not _uid(request):
+    uid = _uid(request)
+    if not uid:
         return JSONResponse({"error": "sign in first"}, status_code=401)
+    if not _probe_allowed(uid):
+        return _slow_down()
     payload = await request.json()
     try:
         account = _account_from_form(payload)

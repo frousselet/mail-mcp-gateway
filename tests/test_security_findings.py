@@ -316,3 +316,12 @@ def test_the_compose_single_profile_stays_on_loopback():
     single = compose.split("mail-mcp-single:")[1].split("mail-mcp-stdio:")[0]
     assert '"127.0.0.1:${MCP_PORT:-8000}:8000"' in single
     assert "NO authentication" in compose
+
+
+async def test_connection_tests_are_rate_limited(client):
+    statuses = [
+        (await client.post("/discover", json={"address": "a@icloud.com"})).status_code
+        for _ in range(web.PROBES_PER_MINUTE + 1)
+    ]
+    assert statuses[:-1] == [200] * web.PROBES_PER_MINUTE
+    assert statuses[-1] == 429

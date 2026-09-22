@@ -62,6 +62,7 @@ def page(
     title: str,
     nav: str = "",
     after: str = "",
+    wide: bool = False,
 ) -> str:
     """Wrap a body in the document shell.
 
@@ -78,7 +79,7 @@ def page(
 </head>
 <body{f' data-after="{esc(after)}"' if after else ""}>
 <a class="skip" href="#main">Skip to content</a>
-<div class="shell">
+<div class="shell{' shell-wide' if wide else ''}">
 {_with_csrf(nav)}
 <main id="main">
 {_with_csrf(body)}
@@ -100,7 +101,8 @@ def _header(title: str, email: str = "", current: str = "") -> str:
   <h1>{esc(title)}</h1>
   <div class="who">
     <nav class="main" aria-label="Main">
-      {link("/", "Connectors", "connectors")}
+      {link("/", "Dashboard", "home")}
+      {link("/connectors", "Connectors", "connectors")}
       {link("/logs", "Activity", "logs")}
       {link("/account", "Passkeys", "account")}
       <form method="post" action="/logout" class="inline">
@@ -424,7 +426,23 @@ def _connector_card(connection: dict[str, Any]) -> str:
 </section>"""
 
 
-def dashboard_page(
+def _new_connector_form() -> str:
+    gate = (
+        '<label for="onboard_code">Invite code<input id="onboard_code" '
+        'name="onboard_code" required autocomplete="off"></label>'
+        if _invite_required()
+        else ""
+    )
+    return f"""
+  <form method="post" action="/connections/new">
+    {gate}
+    <label for="label">Name<input id="label" name="label" required
+      autocomplete="off" placeholder="Claude on my laptop"></label>
+    <p><button type="submit" data-busy="Creating">Create connector</button></p>
+  </form>"""
+
+
+def connectors_page(
     email: str,
     connections: list[dict[str, Any]],
     error: str = "",
@@ -444,15 +462,8 @@ def dashboard_page(
 </div>"""
     )
 
-    gate = (
-        '<label for="onboard_code">Invite code<input id="onboard_code" '
-        'name="onboard_code" required autocomplete="off"></label>'
-        if open_registration is False and _invite_required()
-        else ""
-    )
-
     body = f"""
-{_header("Your MCP connectors", email, "connectors")}
+{_header("Connectors", email, "connectors")}
 {_notice(error, "error")}{_notice(notice, "ok")}
 {cards}
 
@@ -460,15 +471,305 @@ def dashboard_page(
 <div class="card">
   <p class="muted">Give it a name you will recognise later. One connector per
   agent, or per purpose, keeps revoking simple.</p>
-  <form method="post" action="/connections/new">
-    {gate}
-    <label for="label">Name<input id="label" name="label" required
-      autocomplete="off" placeholder="Claude on my laptop"></label>
-    <p><button type="submit" data-busy="Creating">Create connector</button></p>
-  </form>
+  {_new_connector_form()}
 </div>
 """
-    return page(body, title="Your connectors")
+    return page(body, title="Connectors")
+
+
+# ---------------------------------------------------------------------------
+# Home: the dashboard
+# ---------------------------------------------------------------------------
+
+
+def connector_health(connection: dict[str, Any]) -> tuple[str, str, str]:
+    """``(label, badge kind, what to do)`` for one connector, in words."""
+    activity = connection.get("activity") or {}
+    attached = connection.get("accounts") or connection.get("calendars")
+    if not attached:
+        return "Not finished", "attn", "Attach a mailbox or a calendar to it."
+    if not activity.get("last_used"):
+        return (
+            "Waiting for the agent",
+            "idle",
+            "Paste its connection details into Claude.",
+        )
+    if activity.get("errors_7d"):
+        count = activity["errors_7d"]
+        return (
+            "Some calls failed",
+            "attn",
+            f"{count} call{'s' if count > 1 else ''} failed or refused this week.",
+        )
+    if not activity.get("calls_7d"):
+        return "Quiet this week", "idle", "No call in the last 7 days."
+    return "Working", "good", ""
+
+
+def _kpi(label: str, value: str, note: str = "") -> str:
+    note_html = f'<span class="kpi-note">{esc(note)}</span>' if note else ""
+    return (
+        f'<div class="kpi"><span class="kpi-label">{esc(label)}</span>'
+        f'<span class="kpi-value">{esc(value)}</span>'
+        f"{note_html}</div>"
+    )
+
+
+def _plural(count: int, word: str, many: str = "") -> str:
+    return f"{count} {word if count == 1 else (many or word + 's')}"
+
+
+def _outcome_badge(status: str) -> str:
+    text, kind = {
+        "ok": ("Succeeded", "good"),
+        "denied": ("Refused", "attn"),
+    }.get(status, ("Failed", "bad"))
+    return _badge(text, kind)
+
+
+def home_page(
+    email: str,
+    *,
+    connections: list[dict[str, Any]],
+    overview: Any,
+    now: float,
+    open_registration: bool = False,
+    notice: str = "",
+) -> str:
+    """The answer to "is everything fine, and what have the agents been doing?"."""
+    from mail_mcp.activity import humanise_age
+
+    if not connections:
+        steps = """
+<ol class="steps">
+  <li><strong>Create a connector.</strong> One per agent: it has its own
+  credentials, so you can revoke it on its own.</li>
+  <li><strong>Attach a mailbox or a calendar.</strong> Read only, or allowed to
+  send and change things: you decide for each one.</li>
+  <li><strong>Paste its details into Claude</strong> (Settings, Connectors, Add
+  custom connector). Every call it makes then shows up here.</li>
+</ol>"""
+        body = f"""
+{_header("Dashboard", email, "home")}
+{_notice(notice, "ok")}
+<section class="card" aria-labelledby="start">
+  <h2 id="start">Get started</h2>
+  <p class="muted">This gateway gives an AI agent access to email and calendars,
+  within the limits you set, and keeps a record of everything it does.</p>
+  {steps}
+  <h3>Your first connector</h3>
+  {_new_connector_form()}
+</section>"""
+        return page(body, title="Dashboard", wide=True)
+
+    o = overview
+    mailboxes = sum(len(c["accounts"]) for c in connections)
+    calendars = sum(len(c.get("calendars", [])) for c in connections)
+    read_only = sum(
+        1
+        for c in connections
+        for item in [*c["accounts"], *c.get("calendars", [])]
+        if item.get("read_only")
+    )
+    healths = [(c, *connector_health(c)) for c in connections]
+    troubled = [item for item in healths if item[2] in ("attn", "bad")]
+
+    # --- the one-line answer
+    if o.failed_24h:
+        headline = _notice(
+            f"{_plural(o.failed_24h, 'call')} failed or {'was' if o.failed_24h == 1 else 'were'} "
+            "refused in the last 24 hours. The details are below.",
+            "warn",
+        )
+    elif troubled:
+        headline = _notice(
+            f"{_plural(len(troubled), 'connector')} need{'s' if len(troubled) == 1 else ''} "
+            "your attention.",
+            "warn",
+        )
+    else:
+        headline = _notice("Everything is working.", "ok")
+
+    # --- key figures
+    rate = o.success_rate
+    kpis = "".join(
+        [
+            _kpi(
+                "Calls, last 24 hours",
+                str(o.last_24h),
+                f"{o.previous_24h} the day before",
+            ),
+            _kpi(
+                f"Calls, last {len(o.days)} days",
+                str(o.window_calls),
+                f"{_plural(sum(1 for c in connections if (c.get('activity') or {}).get('calls_7d')), 'connector')} "
+                "active this week",
+            ),
+            _kpi(
+                "Success rate",
+                f"{rate * 100:.0f}%" if rate is not None else "No calls",
+                f"{o.window_failed} failed or refused" if rate is not None else "",
+            ),
+            _kpi(
+                "Typical response",
+                f"{o.median_ms} ms" if o.median_ms else "No calls",
+                "median time per call" if o.median_ms else "",
+            ),
+            _kpi(
+                "Accounts reachable",
+                str(mailboxes + calendars),
+                f"{_plural(mailboxes, 'mailbox', 'mailboxes')}, "
+                f"{_plural(calendars, 'calendar')}, {read_only} read only",
+            ),
+        ]
+    )
+
+    # --- charts
+    days = [
+        charts.DayPoint(label=d["label"], full=d["full"], ok=d["ok"], failed=d["failed"])
+        for d in o.days
+    ]
+    trend = charts.daily_activity_chart(days, title=f"Calls per day, last {len(days)} days")
+    tools = charts.tool_usage_chart(o.tools[:6], title="Most used tools") or (
+        '<p class="muted">No tool used yet.</p>'
+    )
+    accounts = charts.tool_usage_chart(
+        o.by_account[:6], title="Busiest accounts", column="Account"
+    ) or '<p class="muted">No account used yet.</p>'
+
+    # --- connectors
+    rows = []
+    for connection, label, kind, _hint in healths:
+        activity = connection.get("activity") or {}
+        series = activity.get("series") or []
+        spark = charts.sparkline(
+            series, label=f"{sum(series)} calls over the last {len(series)} days"
+        ) or '<span class="muted small-text">No calls</span>'
+        rows.append(
+            f"""<tr>
+  <th scope="row"><a href="/connectors#c-{esc(connection['connection_id'])}">{esc(connection['label'] or 'Connector')}</a>
+    <span class="muted small-text block">{esc(_attached(connection))}</span></th>
+  <td>{_badge(label, kind)}</td>
+  <td class="spark-cell">{spark}</td>
+  <td class="num">{activity.get('calls_7d', 0)}</td>
+  <td class="num">{activity.get('errors_7d', 0)}</td>
+  <td>{esc(activity.get('last_used') or 'Never')}</td>
+</tr>"""
+        )
+    health_table = f"""
+<div class="table-wrap"><table class="health">
+  <caption class="sr-only">Connector health</caption>
+  <thead><tr>
+    <th scope="col">Connector</th><th scope="col">Status</th>
+    <th scope="col">Last {len(o.days)} days</th><th scope="col" class="num">Calls, 7 days</th>
+    <th scope="col" class="num">Failed, 7 days</th><th scope="col">Last used</th>
+  </tr></thead>
+  <tbody>{"".join(rows)}</tbody>
+</table></div>"""
+
+    # --- what needs doing
+    attention = []
+    for connection, label, kind, hint in troubled:
+        target = (
+            f"/connections/{connection['connection_id']}"
+            if label == "Not finished"
+            else f"/logs?connection_id={connection['connection_id']}&status=error"
+        )
+        attention.append(
+            f'<li>{_badge(label, kind)} <a href="{esc(target)}">'
+            f"{esc(connection['label'] or 'Connector')}</a>: {esc(hint)}</li>"
+        )
+    shown_failures = o.recent_failures[:3]
+    for entry in shown_failures:
+        detail = (entry.detail or "").strip()
+        if len(detail) > 160:
+            detail = detail[:159] + "…"
+        where = f" on {esc(entry.account)}" if entry.account else ""
+        more = f'<span class="muted small-text block">{esc(detail)}</span>' if detail else ""
+        attention.append(
+            f"<li>{_outcome_badge(entry.status)} <code>{esc(entry.tool)}</code>"
+            f"{where}, {esc(humanise_age(entry.ts, now))}{more}</li>"
+        )
+    if o.window_failed > len(shown_failures):
+        attention.append(
+            '<li><a href="/logs?status=error">See every failed call</a> '
+            f"({o.window_failed} in the last {len(o.days)} days)</li>"
+        )
+    if open_registration:
+        attention.append(
+            f"<li>{_badge('Open sign-up', 'attn')} Anyone who can reach this gateway "
+            "can create an account on it. Set <code>MAIL_ONBOARD_CODE</code> to "
+            "require an invite code.</li>"
+        )
+    attention_html = (
+        f'<ul class="feed">{"".join(attention)}</ul>'
+        if attention
+        else '<p class="muted">Nothing needs your attention.</p>'
+    )
+
+    # --- latest calls
+    feed = "".join(
+        f"""<li><span class="feed-main"><code>{esc(entry.tool)}</code> {_outcome_badge(entry.status)}</span>
+  <span class="muted small-text block">{esc(entry.account or entry.connection_label or '')}
+  &middot; <time title="{esc(_utc(entry.ts))}">{esc(humanise_age(entry.ts, now))}</time></span></li>"""
+        for entry in o.recent[:6]
+    )
+    recent_html = (
+        f'<ul class="feed">{feed}</ul>'
+        '<p><a href="/logs">See all activity</a></p>'
+        if feed
+        else '<p class="muted">No call yet. Once an agent uses a connector, its '
+        "calls appear here.</p>"
+    )
+
+    body = f"""
+{_header("Dashboard", email, "home")}
+{_notice(notice, "ok")}
+{headline}
+<section aria-label="Key figures" class="kpis">{kpis}</section>
+
+<section class="card" aria-label="Activity over time">{trend}</section>
+
+<div class="dash-grid even">
+  <section class="card" aria-labelledby="attention">
+    <h2 id="attention" class="card-title">Needs attention</h2>
+    {attention_html}
+  </section>
+  <section class="card" aria-labelledby="recent">
+    <h2 id="recent" class="card-title">Latest calls</h2>
+    {recent_html}
+  </section>
+</div>
+
+<section class="card" aria-labelledby="health">
+  <div class="card-head">
+    <h2 id="health">Connectors</h2>
+    <a class="btn small secondary" href="/connectors">Manage connectors</a>
+  </div>
+  {health_table}
+</section>
+
+<div class="dash-grid even">
+  <section class="card" aria-label="Most used tools">{tools}</section>
+  <section class="card" aria-label="Busiest accounts">{accounts}</section>
+</div>
+"""
+    return page(body, title="Dashboard", wide=True)
+
+
+def _attached(connection: dict[str, Any]) -> str:
+    parts = []
+    if connection["accounts"]:
+        parts.append(_plural(len(connection["accounts"]), "mailbox", "mailboxes"))
+    if connection.get("calendars"):
+        parts.append(_plural(len(connection["calendars"]), "calendar"))
+    return ", ".join(parts) or "Nothing attached"
+
+
+def _utc(stamp: float) -> str:
+    import time as _time
+
+    return _time.strftime("%Y-%m-%d %H:%M:%S UTC", _time.gmtime(stamp))
 
 
 def _invite_required() -> bool:
@@ -512,7 +813,7 @@ def credentials_page(
   <p class="muted">You can come back to this page whenever you need it. If the
   secret has leaked, issue a new one below: the agent will have to reconnect.</p>
   <div class="actions">
-    <a class="btn secondary" href="/">Back to connectors</a>
+    <a class="btn secondary" href="/connectors">Back to connectors</a>
     <a class="btn small" href="/connections/{esc(connection['connection_id'])}">Add a mailbox</a>
     <form method="get" action="/connections/rotate">
       {_hidden({"connection_id": connection["connection_id"]})}
@@ -534,7 +835,7 @@ def confirm_page(
     fields: dict[str, str],
     confirm_label: str,
     email: str = "",
-    cancel: str = "/",
+    cancel: str = "/connectors",
 ) -> str:
     """Server-rendered confirmation for anything destructive.
 
@@ -771,7 +1072,8 @@ def calendar_form_page(
     <h2>Server</h2>
     <div class="grid">
       <label for="url">CalDAV URL<span class="hint">Optional for known
-        providers.</span><input id="url" name="url" autocomplete="off"
+        providers. Must start with https://.</span><input id="url" name="url"
+        type="url" autocomplete="off"
         placeholder="https://caldav.example.com" value="{_value(values, 'url')}"></label>
       <label for="username">Username<span class="hint">Defaults to the
         address.</span><input id="username" name="username" autocomplete="off"

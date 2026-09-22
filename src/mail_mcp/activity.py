@@ -300,6 +300,22 @@ class Overview:
     failed: int = 0
     last_24h: int = 0
     accounts: list[str] = field(default_factory=list)
+    # For the home dashboard.
+    previous_24h: int = 0  # the 24 hours before the last 24
+    failed_24h: int = 0
+    window_calls: int = 0  # calls inside the ``days`` window
+    window_failed: int = 0
+    median_ms: int = 0  # typical duration of a call in the window
+    by_account: list[tuple[str, int]] = field(default_factory=list)
+    recent: list[ActivityEntry] = field(default_factory=list)
+    recent_failures: list[ActivityEntry] = field(default_factory=list)
+
+    @property
+    def success_rate(self) -> float | None:
+        """Share of calls in the window that succeeded, or None without calls."""
+        if not self.window_calls:
+            return None
+        return (self.window_calls - self.window_failed) / self.window_calls
 
 
 def overview(
@@ -328,8 +344,15 @@ def overview(
     tools: dict[str, int] = {}
     per_connection: dict[str, dict[str, Any]] = {}
     accounts: set[str] = set()
-    total = failed = last_24h = 0
+    account_calls: dict[str, int] = {}
+    durations: list[int] = []
+    recent: list[ActivityEntry] = []
+    recent_failures: list[ActivityEntry] = []
+    total = failed = last_24h = previous_24h = failed_24h = 0
+    window_calls = window_failed = 0
     day_ago = moment - 86400
+    two_days_ago = moment - 2 * 86400
+    week_ago = moment - 7 * 86400
 
     if entries is None:
         entries = log.read(owner_id=owner_id, limit=log.capacity)
@@ -340,9 +363,18 @@ def overview(
             failed += 1
         if entry.ts >= day_ago:
             last_24h += 1
+            if not succeeded:
+                failed_24h += 1
+        elif entry.ts >= two_days_ago:
+            previous_24h += 1
         if entry.account:
             accounts.add(entry.account)
         tools[entry.tool] = tools.get(entry.tool, 0) + 1
+        # Entries come most recent first.
+        if len(recent) < 8:
+            recent.append(entry)
+        if not succeeded and entry.ts >= week_ago and len(recent_failures) < 5:
+            recent_failures.append(entry)
 
         bucket = per_connection.setdefault(
             entry.connection_id,
@@ -353,6 +385,13 @@ def overview(
         position = index.get(_dt.datetime.fromtimestamp(entry.ts).date())
         if position is None:
             continue
+        window_calls += 1
+        if not succeeded:
+            window_failed += 1
+        if entry.duration_ms:
+            durations.append(entry.duration_ms)
+        if entry.account:
+            account_calls[entry.account] = account_calls.get(entry.account, 0) + 1
         buckets[position]["ok" if succeeded else "failed"] += 1
         bucket["series"][position] += 1
         if entry.ts >= moment - 7 * 86400:
@@ -361,6 +400,7 @@ def overview(
                 bucket["errors_7d"] += 1
 
     ranked = sorted(tools.items(), key=lambda item: (-item[1], item[0]))
+    durations.sort()
     return Overview(
         days=buckets,
         tools=ranked,
@@ -369,6 +409,14 @@ def overview(
         failed=failed,
         last_24h=last_24h,
         accounts=sorted(accounts),
+        previous_24h=previous_24h,
+        failed_24h=failed_24h,
+        window_calls=window_calls,
+        window_failed=window_failed,
+        median_ms=durations[len(durations) // 2] if durations else 0,
+        by_account=sorted(account_calls.items(), key=lambda item: (-item[1], item[0])),
+        recent=recent,
+        recent_failures=recent_failures,
     )
 
 
