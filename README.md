@@ -190,6 +190,13 @@ table of well-known providers first, then the
 `autoconfig`/`.well-known` endpoints. Whatever comes back is editable, and
 nothing is trusted until the connection test passes.
 
+A mailbox already attached can be changed later with **Edit** on the Connectors
+page: servers, ports, security, usernames, password, display name, sending
+addresses, read-only, authentication. The form starts from the current
+settings; the password field left empty keeps the stored password, so fixing a
+port does not mean typing it again. The new settings are saved only once IMAP
+and SMTP both answer with them, and the agent uses them from its next call.
+
 Most large providers refuse your normal password over IMAP:
 
 | Provider            | What to use                                                          |
@@ -372,7 +379,7 @@ every variable.
 
 ```bash
 uv venv && uv pip install -e ".[dev]"
-uv run pytest        # 410 tests, including fake IMAP and CalDAV servers
+uv run pytest        # 418 tests, including fake IMAP and CalDAV servers
 uv run ruff check src tests
 ```
 

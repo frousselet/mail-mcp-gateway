@@ -408,6 +408,40 @@ class ConnectionStore:
             await self._save()
             return account
 
+    async def update_account(
+        self, connection_id: str, account: MailAccount, owner_id: str | None = None
+    ) -> MailAccount | None:
+        """Replace the settings of a mailbox already attached to a connection.
+
+        The mailbox keeps its id, its creation date and whether it is the
+        default. An empty password (or OAuth client secret) means "unchanged":
+        the stored one is kept, so fixing a port does not require the password
+        again. The revision changes, so the live connections using the old
+        settings are closed and the next tool call uses the new ones.
+        """
+        async with self._lock:
+            record = self._data["connections"].get(connection_id)
+            if record is None:
+                return None
+            if owner_id is not None and record.get("owner_id", "") != owner_id:
+                return None
+            current = record.get("accounts", {}).get(account.account_id)
+            if current is None:
+                return None
+            account.created_at = current.get("created_at") or account.created_at
+            stored = account.to_record()
+            stored["secret_enc"] = (
+                self._enc(account.secret) if account.secret else current.get("secret_enc", "")
+            )
+            if account.oauth_client_secret:
+                stored["oauth_client_secret_enc"] = self._enc(account.oauth_client_secret)
+            elif current.get("oauth_client_secret_enc") and account.auth == "xoauth2":
+                stored["oauth_client_secret_enc"] = current["oauth_client_secret_enc"]
+            record["accounts"][account.account_id] = stored
+            record["revision"] = record.get("revision", 0) + 1
+            await self._save()
+            return account
+
     async def remove_account(
         self, connection_id: str, account_id: str, owner_id: str | None = None
     ) -> bool:

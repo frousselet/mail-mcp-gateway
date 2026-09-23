@@ -131,6 +131,8 @@ button:disabled, .btn[aria-disabled="true"] { opacity: .55; cursor: not-allowed;
 @media (pointer: coarse) { button.small, .btn.small { min-height: 44px; padding-inline: .9rem; } }
 .actions { display: flex; flex-wrap: wrap; gap: var(--s2); align-items: center; }
 .actions form { margin: 0; }
+td .actions { flex-wrap: nowrap; justify-content: flex-end; }
+@media (max-width: 40rem) { td .actions { justify-content: flex-start; } }
 
 /* ---------------------------------------------------------------- cards */
 .card {
@@ -169,7 +171,7 @@ label { display: block; margin-top: var(--s4); font-weight: 600; }
 label .hint { display: block; font-weight: 400; color: var(--muted); font-size: var(--fs-sm); }
 input, select, textarea {
   width: 100%; padding: .55rem .6rem; margin-top: var(--s1);
-  font: inherit; font-size: var(--fs-base);
+  font: inherit; font-size: var(--fs-base); font-weight: 400;
   color: var(--text); background: var(--surface);
   border: 1px solid var(--border-strong); border-radius: var(--r-sm);
 }
@@ -495,7 +497,7 @@ async function doLogin(button) {
 const MAILBOX_FIELDS = ['address', 'secret', 'imap_host', 'imap_port', 'imap_security',
   'imap_username', 'smtp_host', 'smtp_port', 'smtp_security', 'smtp_username',
   'auth', 'oauth_provider', 'oauth_client_id', 'oauth_client_secret', 'oauth_tenant',
-  'verify_ssl'];
+  'verify_ssl', 'connection_id', 'account_id'];
 
 async function detectSettings(button) {
   const address = ($('address') || {}).value;

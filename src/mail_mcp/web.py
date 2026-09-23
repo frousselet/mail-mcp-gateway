@@ -323,6 +323,7 @@ NOTICES = {
     "calendar_removed": "Calendar removed from that connector.",
     "connector_deleted": "Connector deleted. Any agent using it has lost access.",
     "default_changed": "Default account changed.",
+    "mailbox_updated": "Mailbox updated. The agent uses the new settings from its next call.",
     "passkey_removed": "Passkey removed.",
 }
 
@@ -899,6 +900,122 @@ async def mailbox_add(request: Request) -> Response:
     return _redirect("/connectors", "mailbox_added")
 
 
+def _owned_mailbox(uid: str, connection_id: str, account_id: str):
+    """``(connection, mailbox)`` when both exist and belong to this user."""
+    store = _store()
+    connection = store.get_connection(connection_id) if store else None
+    if connection is None or connection.owner_id != uid:
+        return None, None
+    box = next((a for a in connection.accounts if a.account_id == account_id), None)
+    return connection, box
+
+
+def _mailbox_values(box: MailAccount) -> dict[str, Any]:
+    """A stored mailbox as the form shows it (never its secrets)."""
+    return {
+        "address": box.address,
+        "from_name": box.from_name,
+        "from_address": box.from_address,
+        "aliases": ", ".join(box.aliases),
+        "imap_host": box.imap_host,
+        "imap_port": box.imap_port,
+        "imap_security": box.imap_security,
+        # A username equal to the address is the default: show the field empty.
+        "imap_username": "" if box.imap_username == box.address else box.imap_username,
+        "smtp_host": box.smtp_host,
+        "smtp_port": box.smtp_port,
+        "smtp_security": box.smtp_security,
+        "smtp_username": "" if box.smtp_username == box.address else box.smtp_username,
+        "auth": box.auth,
+        "oauth_provider": box.oauth_provider,
+        "oauth_client_id": box.oauth_client_id,
+        "oauth_tenant": box.oauth_tenant or "common",
+        "verify_ssl": box.verify_ssl,
+        "read_only": box.read_only,
+    }
+
+
+def _keep_secrets(account: MailAccount, current: MailAccount) -> None:
+    """Empty secret fields mean "unchanged": take them from the stored mailbox."""
+    if not account.secret:
+        account.secret = current.secret
+    if not account.oauth_client_secret and account.auth == current.auth:
+        account.oauth_client_secret = current.oauth_client_secret
+
+
+@mcp.custom_route("/mailboxes/edit", methods=["GET"])
+async def mailbox_edit(request: Request) -> Response:
+    uid = _uid(request)
+    if not uid:
+        return RedirectResponse("/login", status_code=303)
+    connection, box = _owned_mailbox(
+        uid,
+        request.query_params.get("connection_id", ""),
+        request.query_params.get("account_id", ""),
+    )
+    if connection is None:
+        return await _dashboard(request, error="That connector no longer exists.")
+    if box is None:
+        return await _dashboard(request, error="That mailbox is no longer there.")
+    view = _connection_view(
+        connection, _base_url(request), email=request.session.get("email", "")
+    )
+    return HTMLResponse(
+        ui.mailbox_form_page(view, values=_mailbox_values(box), editing=box.account_id)
+    )
+
+
+@mcp.custom_route("/mailboxes/update", methods=["POST"])
+async def mailbox_update(request: Request) -> Response:
+    uid = _uid(request)
+    if not uid:
+        return RedirectResponse("/login", status_code=303)
+    form = await _form(request)
+    if form is None:
+        return _expired()
+    connection, box = _owned_mailbox(
+        uid, str(form.get("connection_id", "")), str(form.get("account_id", ""))
+    )
+    if connection is None:
+        return await _dashboard(request, error="That connector no longer exists.")
+    if box is None:
+        return await _dashboard(request, error="That mailbox is no longer there.")
+
+    view = _connection_view(
+        connection, _base_url(request), email=request.session.get("email", "")
+    )
+    typed = {
+        key: value
+        for key, value in form.items()
+        if key not in ("secret", "oauth_client_secret", "csrf")
+    }
+
+    def refused(message: str) -> HTMLResponse:
+        return HTMLResponse(
+            ui.mailbox_form_page(view, error=message, values=typed, editing=box.account_id),
+            status_code=400,
+        )
+
+    account = _account_from_form(form)
+    account.account_id = box.account_id
+    _keep_secrets(account, box)
+    try:
+        account.validate()
+    except AccountConfigError as e:
+        return refused(str(e))
+
+    probe = await _probe(account)
+    if not probe["ok"]:
+        return refused(f"{probe['message']} Nothing was changed.")
+
+    account.settings_source = "manual"
+    saved = await _store().update_account(connection.connection_id, account, owner_id=uid)
+    if saved is None:
+        return await _dashboard(request, error="That mailbox is no longer there.")
+    logger.info("User %s updated %s on %s", uid, account.address, connection.connection_id)
+    return _redirect("/connectors", "mailbox_updated")
+
+
 @mcp.custom_route("/mailboxes/remove", methods=["GET"])
 async def mailbox_remove_confirm(request: Request) -> Response:
     uid = _uid(request)
@@ -1311,6 +1428,12 @@ async def test_settings(request: Request) -> JSONResponse:
     payload = await request.json()
     try:
         account = _account_from_form(payload)
+        # Testing the edit form: an empty password means the stored one.
+        _, current = _owned_mailbox(
+            uid, str(payload.get("connection_id", "")), str(payload.get("account_id", ""))
+        )
+        if current is not None:
+            _keep_secrets(account, current)
         account.validate()
     except AccountConfigError as e:
         return JSONResponse({"ok": False, "message": str(e)})

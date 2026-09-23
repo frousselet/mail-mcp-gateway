@@ -327,9 +327,13 @@ def _mailbox_rows(connection: dict[str, Any]) -> str:
             f' &middot; {esc(box["auth"])}</div></td>'
             f'<td><span class="label">Access</span>{access_badge(box["read_only"])}</td>'
             f'<td><span class="label">Default</span>{default}</td>'
-            f'<td><form method="get" action="/mailboxes/remove">'
+            '<td><div class="actions">'
+            f'<a class="btn small secondary" href="/mailboxes/edit?connection_id='
+            f'{esc(connection["connection_id"])}&amp;account_id={esc(box["account_id"])}">'
+            "Edit</a>"
+            f'<form method="get" action="/mailboxes/remove">'
             f'{_hidden({"connection_id": connection["connection_id"], "account_id": box["account_id"]})}'
-            '<button class="small danger">Remove</button></form></td>'
+            '<button class="small danger">Remove</button></form></div></td>'
             "</tr>"
         )
     if not rows:
@@ -916,20 +920,58 @@ def _checked(values: dict[str, Any] | None, name: str, default: bool = False) ->
 
 
 def mailbox_form_page(
-    connection: dict[str, Any], error: str = "", values: dict[str, Any] | None = None
+    connection: dict[str, Any],
+    error: str = "",
+    values: dict[str, Any] | None = None,
+    *,
+    editing: str = "",
 ) -> str:
-    """Attach a mailbox. Everything typed survives a failed attempt but the password."""
-    lost_password = (
-        '<p class="muted">Your password was not kept, so type it again. Everything '
-        "else is as you left it.</p>"
-        if error and values
-        else ""
-    )
+    """Attach a mailbox, or change one (``editing`` is its account id).
+
+    Everything typed survives a failed attempt but the password. When editing,
+    the form starts from the mailbox's current settings, and an empty password
+    field keeps the stored password.
+    """
+    title = "Edit a mailbox" if editing else "Add a mailbox"
+    if editing:
+        lost_password = ""
+        action = "/mailboxes/update"
+        ids = (
+            f'<input type="hidden" id="connection_id" name="connection_id" '
+            f'value="{esc(connection["connection_id"])}">'
+            f'<input type="hidden" id="account_id" name="account_id" value="{esc(editing)}">'
+        )
+        secret_hint = (
+            '<span class="hint">Leave empty to keep the current one.</span>'
+        )
+        secret_required = ""
+        submit = "Save changes"
+        saved_note = (
+            "The changes are saved only once IMAP and SMTP have both answered "
+            "with them. The agent uses the new settings from its next call."
+        )
+    else:
+        lost_password = (
+            '<p class="muted">Your password was not kept, so type it again. '
+            "Everything else is as you left it.</p>"
+            if error and values
+            else ""
+        )
+        action = f"/connections/{connection['connection_id']}/mailboxes"
+        ids = ""
+        secret_hint = ""
+        secret_required = " required"
+        submit = "Add mailbox"
+        saved_note = (
+            "The mailbox is saved only once IMAP and SMTP have both answered, so "
+            "a wrong password cannot be stored silently."
+        )
     body = f"""
-{_header("Add a mailbox", connection.get("email", ""), "connectors")}
+{_header(title, connection.get("email", ""), "connectors")}
 <p class="muted">Connector: <strong>{esc(connection['label'])}</strong></p>
 {_notice(error, "error")}{lost_password}
-<form method="post" action="/connections/{esc(connection['connection_id'])}/mailboxes">
+<form method="post" action="{esc(action)}">
+  {ids}
   <div class="card">
     <label for="address">Email address<span class="hint">The mailbox the agent
       will read and send from.</span></label>
@@ -940,8 +982,8 @@ def mailbox_form_page(
     </div>
 
     <label for="secret" id="secret_label"><span id="secret_label_text">Password or app
-      password</span></label>
-    <input id="secret" name="secret" type="password" required autocomplete="off">
+      password</span>{secret_hint}</label>
+    <input id="secret" name="secret" type="password"{secret_required} autocomplete="off">
     <p id="provider_note" class="status" role="status"{"" if values and values.get("provider_note") else " hidden"}>
       {_value(values, "provider_note")}</p>
     <p class="muted">Most providers refuse your normal password here and want an
@@ -1016,8 +1058,9 @@ def mailbox_form_page(
         <label for="oauth_client_id">OAuth client ID<input id="oauth_client_id"
           name="oauth_client_id" autocomplete="off"
           value="{_value(values, 'oauth_client_id')}"></label>
-        <label for="oauth_client_secret">OAuth client secret<input id="oauth_client_secret"
-          name="oauth_client_secret" type="password" autocomplete="off"></label>
+        <label for="oauth_client_secret">OAuth client secret{secret_hint}<input
+          id="oauth_client_secret" name="oauth_client_secret" type="password"
+          autocomplete="off"></label>
       </div>
       <label for="oauth_tenant">Microsoft tenant<span class="hint">Defaults to
         common.</span><input id="oauth_tenant" name="oauth_tenant"
@@ -1032,13 +1075,13 @@ def mailbox_form_page(
 
   <div class="actions">
     <button type="button" class="secondary" data-action="test-mailbox">Test connection</button>
-    <button type="submit" data-busy="Checking and saving">Add mailbox</button>
+    <button type="submit" data-busy="Checking and saving">{submit}</button>
+    {'<a class="btn secondary" href="/connectors">Cancel</a>' if editing else ""}
   </div>
-  <p class="muted">The mailbox is saved only once IMAP and SMTP have both
-  answered, so a wrong password cannot be stored silently.</p>
+  <p class="muted">{saved_note}</p>
 </form>
 """
-    return page(body, title="Add a mailbox")
+    return page(body, title=title)
 
 
 def calendar_form_page(
