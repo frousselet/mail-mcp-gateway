@@ -45,6 +45,7 @@ them.
 | `save_draft`       | Write to Drafts without sending, for the user to finish         |
 | `update_draft`     | Revise a draft in place: only the fields you pass change        |
 | `send_draft`       | Send a draft as it stands, Bcc honoured and stripped            |
+| `edit_message`     | Modify any stored message (received, sent, archived) in place   |
 | `mark_messages`    | Mark read, unread, flagged, unflagged, answered                 |
 | `move_messages`    | Move messages to another folder                                 |
 | `delete_messages`  | Move to Trash, or expunge permanently when asked                |
@@ -72,6 +73,12 @@ and removes the old one, carrying over every field and attachment you did not
 change, and returns the new UID. A draft keeps its Bcc recipients in the
 message, the way mail clients do; `send_draft` honours them in the envelope and
 strips them from what goes out.
+
+`edit_message` does the same for any other message, in any folder: subject,
+recipients, body or attachments. The modified version keeps the original's
+Message-ID (it stays in its conversation), date, flags and every other header,
+and the original goes to Trash unless `keep_original` is set. Only the copy in
+the mailbox changes: whoever already received the message keeps the original.
 
 ### Calendars (CalDAV)
 
@@ -365,7 +372,7 @@ every variable.
 
 ```bash
 uv venv && uv pip install -e ".[dev]"
-uv run pytest        # 401 tests, including fake IMAP and CalDAV servers
+uv run pytest        # 410 tests, including fake IMAP and CalDAV servers
 uv run ruff check src tests
 ```
 

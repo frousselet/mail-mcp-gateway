@@ -384,7 +384,7 @@ def revise_draft(
         bcc=bcc if bcc is not None else list(original.bcc),
         subject=subject if subject is not None else original.subject,
         body=body if body is not None else original.body,
-        html=html if html is not None else original.html,
+        html=_html_after(original, body, html),
         attachments=files,
         headers={
             "In-Reply-To": original.in_reply_to,
@@ -393,6 +393,78 @@ def revise_draft(
         bcc_header=True,
         from_address=from_address or _sender_of(account, original),
     )
+
+
+def _html_after(original: ParsedMessage, body: str | None, html: str | None) -> str:
+    """The HTML version once the text may have changed.
+
+    Keeping the old HTML beside a new text body would show the old content in
+    every client that prefers HTML (most of them), so a new body without a
+    new HTML drops it.
+    """
+    if html is not None:
+        return html
+    return "" if body is not None else original.html
+
+
+# Headers that describe the body; they are rebuilt when the body is.
+_CONTENT_HEADERS = ("content-type", "content-transfer-encoding", "mime-version",
+                    "content-disposition", "content-id", "content-description")
+
+
+def edit_message(
+    original: ParsedMessage,
+    *,
+    subject: str | None = None,
+    to: str | list[str] | None = None,
+    cc: str | list[str] | None = None,
+    bcc: str | list[str] | None = None,
+    body: str | None = None,
+    html: str | None = None,
+    attachments: list[dict[str, Any]] | None = None,
+) -> EmailMessage:
+    """Rewrite a stored message with only the given fields changed.
+
+    Unlike :func:`revise_draft`, which writes a fresh draft, this keeps the
+    message as it is: its Message-ID (so the conversation stays threaded), its
+    Date, its sender and every other header. When only headers change, the
+    body is carried over byte for byte; when the body or the attachments
+    change, the body is rebuilt and the headers are kept.
+
+    ``attachments``: None keeps the current ones, a list replaces them, and an
+    empty list removes them all.
+    """
+    message = message_from_bytes(original.raw, policy=policy.default)
+
+    for name, value in (("To", to), ("Cc", cc), ("Bcc", bcc)):
+        if value is None:
+            continue
+        del message[name]
+        addresses = _split_addresses(value)
+        if addresses:
+            message[name] = ", ".join(addresses)
+    if subject is not None:
+        del message["Subject"]
+        message["Subject"] = _header_line(subject or "(no subject)", "subject")
+
+    if body is None and html is None and attachments is None:
+        return message  # type: ignore[return-value]
+
+    rebuilt = EmailMessage()
+    for name, value in message.items():
+        if name.lower() not in _CONTENT_HEADERS:
+            rebuilt[name] = value
+    new_html = _html_after(original, body, html)
+    text = body if body is not None else original.body
+    if new_html and not text:
+        text = html_to_text(new_html)
+    rebuilt.set_content(text or "")
+    if new_html:
+        rebuilt.add_alternative(new_html, subtype="html")
+    attach_files(
+        rebuilt, carried_attachments(original) if attachments is None else attachments
+    )
+    return rebuilt
 
 
 def _sender_of(account: MailAccount, original: ParsedMessage) -> str | None:

@@ -212,7 +212,8 @@ class _Handler(socketserver.StreamRequestHandler):
         if mailbox is None:
             self._send(f"{tag} NO [TRYCREATE] no such mailbox")
             return
-        uid = mailbox.add(payload)
+        flags = re.search(r"\(([^)]*)\)", args.split("{")[0])
+        uid = mailbox.add(payload, set(flags.group(1).split()) if flags else set())
         self.state.appended.append((name, payload))
         self._send(f"{tag} OK [APPENDUID 1 {uid}] APPEND completed")
 

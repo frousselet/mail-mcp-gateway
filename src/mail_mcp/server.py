@@ -42,6 +42,7 @@ from mail_mcp.composer import (
     prepare_for_sending,
     revise_draft,
 )
+from mail_mcp.composer import edit_message as rewrite_message
 from mail_mcp.events import (
     EventError,
     build_event,
@@ -78,7 +79,7 @@ INSTRUCTIONS = (
     "Mail, reading: `list_folders`, `list_messages`, `search_messages`, "
     "`get_message`, `get_thread`, `get_attachment`, `folder_status`.\n"
     "Mail, writing: `send_message`, `reply_message`, `forward_message`, "
-    "`save_draft`, `update_draft`, `send_draft`, `mark_messages`, "
+    "`save_draft`, `update_draft`, `send_draft`, `edit_message`, `mark_messages`, "
     "`move_messages`, `delete_messages`, `create_folder`.\n"
     "Calendars, reading: `list_calendars`, `list_events`, `search_events`, "
     "`get_event`, `find_free_time`.\n"
@@ -87,7 +88,8 @@ INSTRUCTIONS = (
     "Messages are identified by their IMAP UID **within a folder**, so pass the "
     "same `folder` you listed them from. UIDs are stable, but they are not "
     "shared between folders: after a move, list again to get the new UID. "
-    "Editing a draft rewrites it, so `update_draft` returns a new UID too.\n\n"
+    "Editing a message rewrites it, so `update_draft` and `edit_message` "
+    "return a new UID too.\n\n"
     "Events are identified by their UID, which does not change. Times may be "
     "given as 2026-09-24T10:00, a plain date, \'today\', \'tomorrow\' or an "
     "offset such as \'+7d\'; a time written without an offset is read in the "
@@ -1311,6 +1313,112 @@ _FLAGGED_ONLY = (
     "message flagged deleted in that folder. The user's mail client will purge "
     "them when it compacts the folder."
 )
+
+
+@mcp.tool()
+async def edit_message(
+    uid: int,
+    folder: str = "INBOX",
+    subject: str | None = None,
+    to: str | None = None,
+    cc: str | None = None,
+    bcc: str | None = None,
+    body: str | None = None,
+    html: str | None = None,
+    attachments: list[dict[str, Any]] | None = None,
+    keep_original: bool = False,
+    account: str | None = None,
+) -> str:
+    """Modify a message already in the mailbox, in any folder. Only the fields you pass change.
+
+    For a draft, prefer update_draft. This is for everything else: a received
+    message, a sent one, an archived one. It changes the copy in this mailbox
+    only: whoever already received the message keeps what they received.
+
+    IMAP cannot edit a message in place, so the modified version is written
+    to the same folder, with the same flags, date and Message-ID (it stays in
+    its conversation), and the original goes to Trash unless keep_original is
+    set. The message gets a NEW UID, which is returned.
+
+    Args:
+        uid: The UID of the message to modify.
+        folder: The folder that UID belongs to.
+        subject: New subject.
+        to: Replacement To recipients, comma-separated.
+        cc: Replacement Cc recipients.
+        bcc: Replacement Bcc recipients.
+        body: New plain text body. Without a new html, the HTML version is
+            dropped, so no client keeps showing the old text.
+        html: New HTML body.
+        attachments: [{"filename", "content_base64", "content_type"}] to replace
+            the attachments; [] removes them; omit to keep them.
+        keep_original: Leave the original where it is instead of moving it to Trash.
+        account: Which mailbox to act on (address, label or id).
+    """
+    try:
+        mail_account, client = _resolve(account)
+        _ensure_writable(mail_account, "modifying messages")
+        changed = [
+            name
+            for name, value in (
+                ("subject", subject),
+                ("to", to),
+                ("cc", cc),
+                ("bcc", bcc),
+                ("body", body),
+                ("html", html),
+                ("attachments", attachments),
+            )
+            if value is not None
+        ]
+        if not changed:
+            return "Error: nothing to change. Pass at least one field to modify."
+        original = parse_message(await client.fetch_raw(folder, uid))
+        summaries = await client.fetch_summaries(folder, [uid])
+        flags = summaries[0].get("flags", []) if summaries else []
+        received = summaries[0].get("internal_date") if summaries else None
+        kept_flags = " ".join(
+            f for f in flags if f.lower() not in ("\\recent", "\\deleted")
+        )
+        revised = rewrite_message(
+            original,
+            subject=subject,
+            to=to,
+            cc=cc,
+            bcc=bcc,
+            body=body,
+            html=html,
+            attachments=attachments,
+        )
+        # The new version first: if removing the original fails, the folder
+        # holds both rather than neither.
+        target = await client.resolve_folder(folder)
+        new_uid = await client.append(
+            target,
+            revised.as_bytes(),
+            flags=f"({kept_flags})" if kept_flags else "",
+            when=received,
+        )
+        if keep_original:
+            previous = "kept where it was"
+        else:
+            try:
+                previous = await _discard_message(client, folder, uid)
+            except ImapError as e:
+                previous = f"could not be removed ({e}); remove it by hand"
+        return formatting.format_action(
+            f"Modified **{formatting.one_line(revised.get('Subject', ''))}** in "
+            f"{folder} ({mail_account.address}).",
+            changed=", ".join(changed),
+            new_uid=new_uid if new_uid else "unknown (list the folder to find it)",
+            original=f"UID {uid}, {previous}",
+            note=(
+                "Only this mailbox's copy changed; anyone who already received "
+                "the message still has the original."
+            ),
+        )
+    except Exception as e:
+        return _handle(e)
 
 
 @mcp.tool()
